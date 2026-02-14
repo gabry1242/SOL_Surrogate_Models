@@ -1,11 +1,10 @@
-# scripts/infer_cnn.py
+# infer_cnn.py
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Tuple
-
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,21 +14,28 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class NpyXDataset(Dataset):
-    def __init__(self, x_path: Path):
-        self.X = np.load(x_path)  # (N,C,H,W)
+    def __init__(self, x_path: Path, x_mean: Optional[np.ndarray] = None, x_std: Optional[np.ndarray] = None):
+        self.X = np.load(x_path, mmap_mode="r")  # (N,C,H,W)
         if self.X.ndim != 4:
             raise ValueError("Expected X to be 4D: (N,C,H,W).")
         if self.X.shape[1] < 1:
             raise ValueError("X must have mask in channel 0.")
+        self.x_mean = x_mean
+        self.x_std = x_std
 
     def __len__(self) -> int:
         return int(self.X.shape[0])
 
     def __getitem__(self, idx: int):
-        x = torch.from_numpy(self.X[idx]).float()
-        m = x[0:1]
-        return x, m
+        x = torch.from_numpy(np.array(self.X[idx], dtype=np.float32))  # copy slice from memmap
+        m = x[0:1]  # (1,H,W)
 
+        if self.x_mean is not None and self.x_std is not None:
+            xm = torch.from_numpy(self.x_mean).view(-1, 1, 1)
+            xs = torch.from_numpy(self.x_std).view(-1, 1, 1)
+            x = (x - xm) / xs
+
+        return x, m
 
 
 class ConvBlock(nn.Module):
@@ -47,14 +53,6 @@ class ConvBlock(nn.Module):
 
 
 class UNetSmall(nn.Module):
-    """
-    U-Net for regression:
-    input:  (B, c_in, H, W)
-    output: (B, c_out, H, W)
-
-    Uses MaxPool downsampling and bilinear upsampling.
-    Handles odd sizes by center-cropping skip features.
-    """
     def __init__(self, c_in: int, c_out: int, base: int = 32):
         super().__init__()
         self.enc1 = ConvBlock(c_in, base)
@@ -62,7 +60,6 @@ class UNetSmall(nn.Module):
         self.enc3 = ConvBlock(base * 2, base * 4)
 
         self.pool = nn.MaxPool2d(2)
-
         self.bottleneck = ConvBlock(base * 4, base * 8)
 
         self.up3 = nn.Conv2d(base * 8, base * 4, 1)
@@ -86,30 +83,25 @@ class UNetSmall(nn.Module):
             return x
         top = dh // 2
         left = dw // 2
-        return x[..., top:top+th, left:left+tw]
+        return x[..., top : top + th, left : left + tw]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Encoder
-        e1 = self.enc1(x)                 # (B, base, H, W)
-        e2 = self.enc2(self.pool(e1))     # (B, 2b, H/2, W/2)
-        e3 = self.enc3(self.pool(e2))     # (B, 4b, H/4, W/4)
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
 
-        # Bottleneck
-        b = self.bottleneck(self.pool(e3))  # (B, 8b, H/8, W/8)
+        b = self.bottleneck(self.pool(e3))
 
-        # Decoder stage 3
         u3 = F.interpolate(b, size=e3.shape[-2:], mode="bilinear", align_corners=False)
         u3 = self.up3(u3)
         e3c = self._center_crop(e3, u3.shape[-2:])
         d3 = self.dec3(torch.cat([u3, e3c], dim=1))
 
-        # Decoder stage 2
         u2 = F.interpolate(d3, size=e2.shape[-2:], mode="bilinear", align_corners=False)
         u2 = self.up2(u2)
         e2c = self._center_crop(e2, u2.shape[-2:])
         d2 = self.dec2(torch.cat([u2, e2c], dim=1))
 
-        # Decoder stage 1
         u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
         u1 = self.up1(u1)
         e1c = self._center_crop(e1, u1.shape[-2:])
@@ -118,47 +110,32 @@ class UNetSmall(nn.Module):
         return self.out(d1)
 
 
-
-def masked_mae(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    if mask.shape[1] == 1:
-        mask = mask.expand_as(pred)
-    num = (pred - target).abs() * mask
-    den = mask.sum().clamp_min(eps)
-    return num.sum() / den
-
-
-def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    if mask.shape[1] == 1:
-        mask = mask.expand_as(pred)
-    num = (pred - target).pow(2) * mask
-    den = mask.sum().clamp_min(eps)
-    return num.sum() / den
+def masked_mae_np(pred: np.ndarray, y_true: np.ndarray, mask: np.ndarray, eps: float = 1e-8) -> float:
+    # pred,y_true: (N,C,H,W), mask: (N,1,H,W)
+    m = mask.astype(np.float32)
+    m = np.broadcast_to(m, pred.shape)
+    num = np.abs(pred - y_true) * m
+    den = float(m.sum())
+    if den <= eps:
+        return float("nan")
+    return float(num.sum() / den)
 
 
-@torch.no_grad()
-def masked_rmse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    return torch.sqrt(masked_mse(pred, target, mask))
-
-
-@torch.no_grad()
-def eval_on_test(pred: np.ndarray, y_true: np.ndarray, mask: np.ndarray) -> Dict[str, float]:
-    # pred, y_true: (N,C,H,W) float32 ; mask: (N,1,H,W) float32
-    pred_t = torch.from_numpy(pred)
-    y_t = torch.from_numpy(y_true)
-    m_t = torch.from_numpy(mask)
-    return {
-        "mae": float(masked_mae(pred_t, y_t, m_t).item()),
-        "rmse": float(masked_rmse(pred_t, y_t, m_t).item()),
-    }
+def masked_rmse_np(pred: np.ndarray, y_true: np.ndarray, mask: np.ndarray, eps: float = 1e-8) -> float:
+    m = mask.astype(np.float32)
+    m = np.broadcast_to(m, pred.shape)
+    num = ((pred - y_true) ** 2) * m
+    den = float(m.sum())
+    if den <= eps:
+        return float("nan")
+    return float(np.sqrt(num.sum() / den))
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True, help="Path to checkpoint_best.pt or checkpoint_last.pt")
-    ap.add_argument("--config", required=False, help="Path to config.json saved by training (optional)")
     ap.add_argument("--test_dir", required=True, help="Folder containing global_X_img_test.npy and global_Y_img_test.npy")
     ap.add_argument("--out_dir", required=True, help="Folder to write predictions and metrics")
-
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -173,58 +150,86 @@ def main() -> None:
     if not X_path.exists() or not Y_path.exists():
         raise FileNotFoundError("Expected global_X_img_test.npy and global_Y_img_test.npy in test_dir.")
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     c_in = int(ckpt["c_in"])
     c_out = int(ckpt["c_out"])
-    arch = ckpt.get("arch", "simple")
-
-    if arch == "unet_small":
-        base = int(ckpt["base"])
-        model = UNetSmall(c_in=c_in, c_out=c_out, base=base)
+    arch = str(ckpt.get("arch", "unet_small"))
+    base = int(ckpt.get("base", 32))
     y_channels = str(ckpt.get("y_channels", "all"))
 
-    # Load data
-    X = np.load(X_path)  # (N,C,H,W)
-    Y = np.load(Y_path)  # (N,C,H,W)
-    if y_channels.strip().lower() not in ("all", "*"):
-        # subset the same channels used in training
-        ch = tuple(int(p.strip()) for p in y_channels.split(",") if p.strip() != "")
-        Y = Y[:, list(ch), :, :]
+    x_mean = ckpt.get("x_mean", None)
+    x_std = ckpt.get("x_std", None)
 
-    # Build model
+    if x_mean is not None:
+        x_mean = np.asarray(x_mean, dtype=np.float32)
+    if x_std is not None:
+        x_std = np.asarray(x_std, dtype=np.float32)
+
+    # Load Y for metric computation (subset same channels used in training)
+    Y_full = np.load(Y_path, mmap_mode="r")  # (N,Cy,H,W)
+    if y_channels.strip().lower() not in ("all", "*"):
+        ch = tuple(int(p.strip()) for p in y_channels.split(",") if p.strip() != "")
+        Y = np.array(Y_full[:, list(ch), :, :], dtype=np.float32)
+    else:
+        Y = np.array(Y_full, dtype=np.float32)
+
     device = torch.device(args.device)
-    model = UNetSmall(c_in=c_in, c_out=c_out, base=32).to(device)
+
+    if arch != "unet_small":
+        raise RuntimeError(f"Unsupported arch in checkpoint: {arch}")
+
+    model = UNetSmall(c_in=c_in, c_out=c_out, base=base).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    ds = NpyXDataset(X_path)
+    ds = NpyXDataset(X_path, x_mean=x_mean, x_std=x_std)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=(device.type == "cuda"))
 
-    preds = np.zeros((len(ds), c_out, X.shape[2], X.shape[3]), dtype=np.float32)
-    masks = np.zeros((len(ds), 1, X.shape[2], X.shape[3]), dtype=np.float32)
+    # Shapes
+    X_shape = np.load(X_path, mmap_mode="r").shape
+    N, _, H, W = X_shape
+
+    preds_norm = np.zeros((N, c_out, H, W), dtype=np.float32)
+    masks = np.zeros((N, 1, H, W), dtype=np.float32)
 
     idx0 = 0
     for x, m in dl:
-        b = x.shape[0]
+        b = int(x.shape[0])
         x = x.to(device)
-        pred = model(x).detach().cpu().numpy().astype(np.float32)
-        preds[idx0:idx0+b] = pred
-        masks[idx0:idx0+b] = m.numpy().astype(np.float32)
+        m = m.to(device)
+
+        with torch.no_grad():
+            pred = model(x)
+            pred = pred * m  # enforce gaps = 0
+            pred = torch.pow(10.0, pred) - 1e-3
+            pred = pred.detach().cpu().numpy().astype(np.float32)
+
+        preds_norm[idx0 : idx0 + b] = pred
+        masks[idx0 : idx0 + b] = m.detach().cpu().numpy().astype(np.float32)
         idx0 += b
 
-    # Save predictions
+
+    preds = preds_norm
+
+    # Save predictions (physical units if y_mean/y_std available)
     np.save(out_dir / "pred_Y_img_test.npy", preds)
 
-    # Evaluate masked metrics on test
-    metrics = eval_on_test(preds, Y.astype(np.float32), masks)
+    # Metrics in the same space as Y:
+    # If training normalized Y, then stored Y on disk is physical; we compare to physical preds (denormalized).
+    mae = masked_mae_np(preds, Y, masks)
+    rmse = masked_rmse_np(preds, Y, masks)
+
+    metrics = {"mae": mae, "rmse": rmse}
     with open(out_dir / "test_metrics.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "checkpoint": str(ckpt_path),
                 "c_in": c_in,
                 "c_out": c_out,
+                "arch": arch,
+                "base": base,
                 "y_channels": y_channels,
+                "normalized_infer_input": bool(x_mean is not None and x_std is not None),
                 "metrics": metrics,
             },
             f,
@@ -232,7 +237,7 @@ def main() -> None:
         )
 
     print(f"Saved predictions: {out_dir / 'pred_Y_img_test.npy'}  shape={preds.shape}")
-    print(f"Test masked MAE: {metrics['mae']:.6g} | masked RMSE: {metrics['rmse']:.6g}")
+    print(f"Test masked MAE: {mae:.6g} | masked RMSE: {rmse:.6g}")
 
 
 if __name__ == "__main__":

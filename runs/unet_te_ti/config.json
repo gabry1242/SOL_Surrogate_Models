@@ -1,0 +1,16 @@
+{
+  "train_x": "..\\train_tensor\\global_X_img_train.npy",
+  "train_y": "..\\train_tensor\\global_Y_img_train.npy",
+  "test_x": "..\\test_tensor\\global_X_img_test.npy",
+  "test_y": "..\\test_tensor\\global_Y_img_test.npy",
+  "run_dir": "runs\\unet_te_ti",
+  "y_channels": "0,1",
+  "epochs": 20,
+  "batch_size": 8,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "width": 64,
+  "depth": 6,
+  "seed": 42,
+  "device": "cuda"
+}

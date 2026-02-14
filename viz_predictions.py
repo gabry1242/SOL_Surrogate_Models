@@ -45,9 +45,9 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    X = np.load(test_dir / "global_X_img_test.npy")     # (N,9,H,W)
-    Y = np.load(test_dir / "global_Y_img_test.npy")     # (N,22,H,W)
-    P = np.load(args.pred_path)                         # (N,2,H,W) if trained with y_channels 0,1
+    X = np.load(test_dir / "global_X_img_test.npy", mmap_mode="r")
+    Y = np.load(test_dir / "global_Y_img_test.npy", mmap_mode="r")
+    P = np.load(args.pred_path, mmap_mode="r")                    
 
     i = args.index
     if i < 0 or i >= X.shape[0]:

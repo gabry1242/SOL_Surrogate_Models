@@ -1,0 +1,9 @@
+
+# generated artifacts
+runs/
+**/infer_test/
+**/viz/
+*.npy
+*.npz
+*.pt
+

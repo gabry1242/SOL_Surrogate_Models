@@ -14,7 +14,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 
-
+###CURRENTLY IMPLEMENTING A SINGULAR LOSS BETWEEN ALL CHANNELS. This means that all the weights are updated on the same loss
+###which is an average of all the MAE between all the channels
+#TO DO: change this because probably different fields have different measure units and different gradient changes
 # ----------------------------
 # Masked losses / metrics
 # ----------------------------

@@ -425,7 +425,7 @@ def main() -> None:
             pred = model(x)
             pred = pred * m  # enforce gaps = 0
 
-            loss = masked_mse(pred, y, m)
+            loss = masked_mae(pred, y, m)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()

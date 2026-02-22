@@ -103,3 +103,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#python scripts/visualizations/viz_predictions.py --test_dir scripts/tensor/test 
+# --pred_path scripts/runs/unet_3gap/infer_test/pred_Y_img_test.npy --out_dir scripts/runs/unet_3gap/viz --index 0

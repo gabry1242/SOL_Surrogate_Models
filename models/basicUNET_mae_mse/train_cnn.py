@@ -482,3 +482,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+#Command example python scripts/models/basicUNET_mae_mse/train_cnn.py --train_dir scripts/tensor/train --test_dir scripts/tensor/test 
+# --run_dir scripts/runs/unet_3gap --y_channels 0,1 --epochs 50 --batch_size 32 --lr 1e-4 --weight_decay 1e-5

@@ -242,3 +242,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+#command example python scripts/models/basicUNET_mae_mse/infer_cnn.py --checkpoint scripts/runs/unet_3gap/checkpoint_best.pt 
+# --test_dir scripts/tensor/test --out_dir scripts/runs/unet_3gap/infer_test --batch_size 32

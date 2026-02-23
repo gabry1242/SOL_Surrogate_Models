@@ -1,0 +1,16 @@
+{
+  "train_x": "filled_gap_3\\train\\global_X_img_train.npy",
+  "train_y": "filled_gap_3\\train\\global_Y_img_train.npy",
+  "test_x": "filled_gap_3\\test\\global_X_img_test.npy",
+  "test_y": "filled_gap_3\\test\\global_Y_img_test.npy",
+  "run_dir": "runs\\unet_3gap",
+  "y_channels": "0,1",
+  "epochs": 30,
+  "batch_size": 8,
+  "lr": 0.001,
+  "weight_decay": 0.0,
+  "width": 64,
+  "depth": 6,
+  "seed": 42,
+  "device": "cuda"
+}

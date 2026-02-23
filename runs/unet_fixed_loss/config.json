@@ -1,0 +1,14 @@
+{
+  "train_dir": "tensor/nopad_nofill_geom/train",
+  "test_dir": "tensor/nopad_nofill_geom/test",
+  "run_dir": "runs/unet_fixed_loss",
+  "y_channels": "all",
+  "epochs": 50,
+  "batch_size": 32,
+  "lr": 0.001,
+  "weight_decay": 0.0,
+  "base": 32,
+  "seed": 0,
+  "device": "cuda",
+  "eps": 0.001
+}

@@ -1,0 +1,4 @@
+idx=0
+te: MAE=0.15969799 RMSE=1.1545306
+ti: MAE=0.1051156 RMSE=0.4987101
+valid_pixels=5200 / total_pixels=11780

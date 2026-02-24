@@ -11,12 +11,8 @@
 # - a per-channel metrics table (MAE, RMSE, valid_pixels)
 #
 # Run example:
-#   python scripts/visualizations/viz_predictions_all_channels.py \
-#     --test_dir scripts/tensor/test \
-#     --pred_path scripts/runs/unet_3gap/infer_test/pred_Y_img_test.npy \
-#     --out_dir scripts/runs/unet_3gap/viz_all \
-#     --index 0 \
-#     --group all
+# python scripts/visualizations/viz_predictions_all_channels.py --test_dir scripts/tensor/test --pred_path scripts/runs/unet_3gap/infer_test/pred_Y_img_test.npy 
+# --out_dir scripts/runs/unet_3gap/viz_all --index 0 --group all
 #
 from __future__ import annotations
 

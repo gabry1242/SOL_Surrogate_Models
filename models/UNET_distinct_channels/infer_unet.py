@@ -182,7 +182,7 @@ def main() -> None:
     ap.add_argument("--checkpoint", required=True, help="Path to checkpoint_best.pt or checkpoint_last.pt from train_unet.py")
     ap.add_argument("--test_dir", required=True, help="Folder containing global_X_img_test.npy and global_Y_img_test.npy")
     ap.add_argument("--out_dir", required=True, help="Folder to write predictions and metrics")
-    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -289,3 +289,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+#n.b. **something** indicates that the value inside can be changed based on which tensor/directory you want to analyze
+
+#python scripts/models/UNET_distinct_channels/infer_unet.py --checkpoint scripts/runs/**unet_50_width64**/checkpoint_best.pt 
+# --test_dir scripts/tensor/**nopad_nofill_geom**/test --out_dir scripts/runs/**unet_50_width64**/infer_test --batch_size 32

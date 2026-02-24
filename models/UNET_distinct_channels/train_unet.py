@@ -437,7 +437,7 @@ def main() -> None:
 
     ap.add_argument("--y_channels", default="all", help='Target channels, e.g. "0,1" or "all"')
     ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=0.0)
 
@@ -445,7 +445,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
-    ap.add_argument("--eps", type=float, default=1e-3, help="epsilon for log10 transform on positive channels")
+    ap.add_argument("--eps", type=float, default=1e-5, help="epsilon for log10 transform on positive channels")
 
     args = ap.parse_args()
 
@@ -614,3 +614,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+#mock command to execute
+#python scripts/models/UNET_distinct_channels/train_unet.py --train_dir scripts/tensor/nopad_nofill_geom/train --val_dir scripts/tensor/nopad_nofill_geom/test --run_dir scripts/runs/unet_50_width64 --y_channels all --epochs 50 --batch_size 32 --base 64

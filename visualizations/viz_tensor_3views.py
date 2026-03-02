@@ -2,223 +2,211 @@
 """
 viz_tensor_3views.py
 
-Viewer for tensors produced by tensor_3_images.py / tensor_3_images_fixed.py.
+Visualize 3-view tensors created by tensor_3_images.py.
 
 Loads:
-  <prefix>_X_img_<split>.npy
-  <prefix>_Y_img_<split>.npy
+- <prefix>_X_img_<split>.npy        (N,3,Cin,H,W)
+- <prefix>_Y_img_<split>.npy        (N,3,Cout,H,W)
 Optional:
-  <mask_file>  (typically <prefix>_mask_views_k<k>.npy OR <prefix>_mask_views_fromX_<split>.npy)
+- <prefix>_mask_views_k{k}.npy      (N,3,H,W) or (3,H,W)
+- <prefix>_layout_map_3views.npz    (for view sizes W0/H0, W1/H1, W2/H2)
 
-Supports:
-- pack="channels": X (N, 3*C_in, H, W), Y (N, 3*C_out, H, W)
-- pack="views":    X (N, 3, C_in, H, W), Y (N, 3, C_out, H, W)
+Outputs PNGs into --out_dir and/or shows interactively.
 
-Plots per view:
-- mask
-- selected X channels
-- selected Y channels
-- optional error maps if --pred_y is provided
+Usage examples:
+  python scripts/visualizations/viz_tensor_3views.py --split train --prefix scripts/tensor/3images/train/global3 --idx 0 --view all --x_channels 0,1,2 --y_channels 0,1
 """
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import List, Optional, Tuple
+
 import numpy as np
 import matplotlib.pyplot as plt
 
 
-VIEW_NAMES = ["top", "mid", "bottom"]
+def _parse_int_list(s: str) -> List[int]:
+    s = s.strip()
+    if s.lower() == "all":
+        return [-1]
+    return [int(x.strip()) for x in s.split(",") if x.strip() != ""]
 
 
-def _parse_int_list(s: str):
-    s = s.strip().lower()
-    if s == "all":
-        return "all"
-    out = []
-    for part in s.split(","):
-        part = part.strip()
-        if part == "":
-            continue
-        out.append(int(part))
+def _load_layout(prefix: str) -> Optional[dict]:
+    p = Path(f"{prefix}_layout_map_3views.npz")
+    if not p.exists():
+        return None
+    z = np.load(p, allow_pickle=True)
+    keys = set(z.files)
+    out = {}
+    for k in ["W0", "H0", "W1", "H1", "W2", "H2", "Hmax", "Wmax"]:
+        if k in keys:
+            out[k] = int(z[k])
     return out
 
 
-def _detect_pack(arr: np.ndarray) -> str:
-    if arr.ndim == 4:
-        return "channels"
-    if arr.ndim == 5:
-        return "views"
-    raise ValueError(f"Unsupported tensor rank: {arr.ndim}, shape={arr.shape}")
+def _resolve_view_crop(layout: Optional[dict], view_id: int, H: int, W: int) -> Tuple[int, int]:
+    if layout is None:
+        return H, W
+    if view_id == 0 and "H0" in layout and "W0" in layout:
+        return min(layout["H0"], H), min(layout["W0"], W)
+    if view_id == 1 and "H1" in layout and "W1" in layout:
+        return min(layout["H1"], H), min(layout["W1"], W)
+    if view_id == 2 and "H2" in layout and "W2" in layout:
+        return min(layout["H2"], H), min(layout["W2"], W)
+    return H, W
 
 
-def _slice_view(arr: np.ndarray, pack: str, view_idx: int, c_per_view: int) -> np.ndarray:
+def _get_mask(prefix: str, split: str, idx: int, X: np.ndarray) -> np.ndarray:
     """
-    Returns (N, C, H, W) for the requested view.
+    Prefer explicit mask file if present; otherwise use X[:,0] channel (mask channel).
+    Returns (3,H,W) float32 in {0,1}.
     """
-    if pack == "views":
-        return arr[:, view_idx]
-    c0 = view_idx * c_per_view
-    c1 = (view_idx + 1) * c_per_view
-    return arr[:, c0:c1]
+    # try N,3,H,W
+    cand = list(Path(prefix).parent.glob(Path(prefix).name + "_mask_views_k*.npy"))
+    if cand:
+        m = np.load(cand[0])
+        if m.ndim == 4:
+            return m[idx].astype(np.float32)
+        if m.ndim == 3:
+            return m.astype(np.float32)
+    return X[idx, :, 0, :, :].astype(np.float32)
 
 
-def _imshow(ax, img2d, title, vmin=None, vmax=None):
-    ax.imshow(img2d, vmin=vmin, vmax=vmax)
+def _imshow(ax, img, title: str, vmin=None, vmax=None):
+    ax.imshow(img, vmin=vmin, vmax=vmax)
     ax.set_title(title)
-    ax.axis("off")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def _save_or_show(fig, out_path: Optional[Path], show: bool):
+    fig.tight_layout()
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+    elif show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", choices=["train", "test"], required=True)
-    ap.add_argument("--tensor_dir", required=True)
-    ap.add_argument("--prefix", required=True)
+    ap.add_argument("--prefix", required=True, help="Path prefix without suffix, e.g. scripts/tensor/3images/train/global3")
     ap.add_argument("--idx", type=int, default=0)
-    ap.add_argument("--view", choices=VIEW_NAMES + ["all"], default="all")
-
-    ap.add_argument("--x_channels", default="0,9,10", help='Per-view X channels to show, e.g. "0,9,10" or "all"')
-    ap.add_argument("--y_channels", default="0,1", help='Per-view Y channels to show, e.g. "0,1" or "all"')
-
-    ap.add_argument("--mask_file", default="", help="Optional mask file inside tensor_dir")
-    ap.add_argument("--pred_y", default="", help="Optional pred_Y file path (same shape as Y) to plot |pred-gt|")
-    ap.add_argument("--save", default="", help="If set, save figure to this path instead of showing.")
+    ap.add_argument("--view", default="all", choices=["0", "1", "2", "all"])
+    ap.add_argument("--x_channels", default="0", help='Comma list or "all". X channels (within Cin). 0 is mask.')
+    ap.add_argument("--y_channels", default="0,1", help='Comma list or "all". Y channels (within Cout).')
+    ap.add_argument("--apply_mask", action="store_true", help="Multiply shown channels by mask.")
+    ap.add_argument("--out_dir", default="scripts/visualizations/out_tensor_3views")
+    ap.add_argument("--no_save", action="store_true")
+    ap.add_argument("--no_show", action="store_true")
     args = ap.parse_args()
 
-    tensor_dir = Path(args.tensor_dir)
-    x_path = tensor_dir / f"{args.prefix}_X_img_{args.split}.npy"
-    y_path = tensor_dir / f"{args.prefix}_Y_img_{args.split}.npy"
+    split = args.split
+    prefix = args.prefix
+    idx = int(args.idx)
 
-    if not x_path.exists():
-        raise FileNotFoundError(str(x_path))
-    if not y_path.exists():
-        raise FileNotFoundError(str(y_path))
+    X_path = Path(f"{prefix}_X_img_{split}.npy")
+    Y_path = Path(f"{prefix}_Y_img_{split}.npy")
+    if not X_path.exists():
+        raise FileNotFoundError(str(X_path))
+    if not Y_path.exists():
+        raise FileNotFoundError(str(Y_path))
 
-    X = np.load(x_path)
-    Y = np.load(y_path)
+    X = np.load(X_path, mmap_mode="r")  # (N,3,Cin,H,W)
+    Y = np.load(Y_path, mmap_mode="r")  # (N,3,Cout,H,W)
 
-    pack_x = _detect_pack(X)
-    pack_y = _detect_pack(Y)
-    if pack_x != pack_y:
-        raise ValueError(f"X/Y pack mismatch: X is {pack_x}, Y is {pack_y}")
-    pack = pack_x
+    N, V, Cin, H, W = X.shape
+    _, _, Cout, Hy, Wy = Y.shape
+    if (Hy, Wy) != (H, W):
+        raise ValueError(f"X/Y spatial mismatch: X=({H},{W}) Y=({Hy},{Wy})")
+    if idx < 0 or idx >= N:
+        raise ValueError(f"--idx out of range: {idx} not in [0,{N-1}]")
 
-    N = int(X.shape[0])
-    if not (0 <= args.idx < N):
-        raise IndexError(f"--idx {args.idx} out of range [0, {N-1}]")
-
-    if pack == "views":
-        if X.shape[1] != 3 or Y.shape[1] != 3:
-            raise ValueError(f"Expected 3 views, got X.shape={X.shape}, Y.shape={Y.shape}")
-        c_in = int(X.shape[2])
-        c_out = int(Y.shape[2])
-        H = int(X.shape[3])
-        W = int(X.shape[4])
-    else:
-        if X.shape[1] % 3 != 0 or Y.shape[1] % 3 != 0:
-            raise ValueError(f"Expected channels divisible by 3. X.shape={X.shape}, Y.shape={Y.shape}")
-        c_in = int(X.shape[1] // 3)
-        c_out = int(Y.shape[1] // 3)
-        H = int(X.shape[2])
-        W = int(X.shape[3])
-
-    # mask loading
-    masks = None
-    if args.mask_file:
-        mpath = tensor_dir / args.mask_file
-        if not mpath.exists():
-            raise FileNotFoundError(str(mpath))
-        masks = np.load(mpath)
-        # allowed shapes:
-        # (3,H,W) OR (H,W) (then used for all views)
-        if masks.ndim == 3:
-            if masks.shape[0] != 3:
-                raise ValueError(f"mask_file must have shape (3,H,W). Got {masks.shape}")
-            if masks.shape[1] != H or masks.shape[2] != W:
-                raise ValueError(f"mask_file spatial mismatch. mask={masks.shape}, expected (3,{H},{W})")
-        elif masks.ndim == 2:
-            if masks.shape != (H, W):
-                raise ValueError(f"mask_file spatial mismatch. mask={masks.shape}, expected ({H},{W})")
-        else:
-            raise ValueError(f"mask_file must be 2D or 3D. Got {masks.ndim}D")
-
-    # optional predictions
-    P = None
-    if args.pred_y:
-        ppath = Path(args.pred_y)
-        if not ppath.exists():
-            raise FileNotFoundError(str(ppath))
-        P = np.load(ppath)
-        if P.shape != Y.shape:
-            raise ValueError(f"--pred_y shape {P.shape} must match Y shape {Y.shape}")
+    layout = _load_layout(prefix)
+    mask3 = _get_mask(prefix, split, idx, X)  # (3,H,W)
 
     x_sel = _parse_int_list(args.x_channels)
     y_sel = _parse_int_list(args.y_channels)
 
-    view_indices = [0, 1, 2] if args.view == "all" else [VIEW_NAMES.index(args.view)]
+    if x_sel == [-1]:
+        x_sel = list(range(Cin))
+    if y_sel == [-1]:
+        y_sel = list(range(Cout))
 
-    plots = []  # (title, img2d, is_mask)
-    for vi in view_indices:
-        Xv = _slice_view(X, pack, vi, c_in)[args.idx]  # (C,H,W)
-        Yv = _slice_view(Y, pack, vi, c_out)[args.idx]  # (C,H,W)
-
-        if masks is None:
-            mv = (Xv[0] > 0).astype(np.float32)  # derive from X mask channel
-        else:
-            if masks.ndim == 3:
-                mv = masks[vi].astype(np.float32)
-            else:
-                mv = masks.astype(np.float32)
-
-        plots.append((f"{VIEW_NAMES[vi]}: mask", mv, True))
-
-        # X channels
-        if x_sel == "all":
-            x_channels = list(range(c_in))
-        else:
-            x_channels = [c for c in x_sel if 0 <= c < c_in]
-        for ch in x_channels:
-            plots.append((f"{VIEW_NAMES[vi]}: X[{ch}]", Xv[ch] * (mv > 0), False))
-
-        # Y channels
-        if y_sel == "all":
-            y_channels = list(range(c_out))
-        else:
-            y_channels = [c for c in y_sel if 0 <= c < c_out]
-        for ch in y_channels:
-            plots.append((f"{VIEW_NAMES[vi]}: Y[{ch}]", Yv[ch] * (mv > 0), False))
-
-        # error channels
-        if P is not None:
-            Pv = _slice_view(P, pack, vi, c_out)[args.idx]
-            for ch in y_channels:
-                err = np.abs(Pv[ch] - Yv[ch]) * (mv > 0)
-                plots.append((f"{VIEW_NAMES[vi]}: |err| Y[{ch}]", err, False))
-
-    n = len(plots)
-    ncols = 4
-    nrows = (n + ncols - 1) // ncols
-    fig = plt.figure(figsize=(4.2 * ncols, 3.6 * nrows))
-
-    for i, (title, img, is_mask) in enumerate(plots, 1):
-        ax = fig.add_subplot(nrows, ncols, i)
-        if is_mask:
-            _imshow(ax, img, title, vmin=0, vmax=1)
-        else:
-            _imshow(ax, img, title)
-
-    fig.suptitle(
-        f"{args.prefix} {args.split} idx={args.idx} pack={pack}  X={X.shape} Y={Y.shape}",
-        fontsize=12,
-    )
-    fig.tight_layout()
-
-    if args.save:
-        out = Path(args.save)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out, dpi=150)
-        print(f"Saved: {out}")
+    if args.view == "all":
+        views = [0, 1, 2]
     else:
-        plt.show()
+        views = [int(args.view)]
+
+    out_dir = Path(args.out_dir)
+    save = not args.no_save
+    show = not args.no_show
+
+    # 1) mask overview per view
+    fig, axes = plt.subplots(1, len(views), figsize=(5 * len(views), 4))
+    if len(views) == 1:
+        axes = [axes]
+    for j, v in enumerate(views):
+        Hc, Wc = _resolve_view_crop(layout, v, H, W)
+        _imshow(axes[j], mask3[v, :Hc, :Wc], f"mask view {v} (idx={idx})", vmin=0, vmax=1)
+    out_path = out_dir / f"idx{idx:05d}_mask_views_{'_'.join(map(str,views))}.png" if save else None
+    _save_or_show(fig, out_path, show)
+
+    # 2) X channels
+    for c in x_sel:
+        if c < 0 or c >= Cin:
+            continue
+        fig, axes = plt.subplots(1, len(views), figsize=(5 * len(views), 4))
+        if len(views) == 1:
+            axes = [axes]
+        for j, v in enumerate(views):
+            Hc, Wc = _resolve_view_crop(layout, v, H, W)
+            img = np.array(X[idx, v, c, :Hc, :Wc], dtype=np.float32)
+            if args.apply_mask:
+                img *= mask3[v, :Hc, :Wc]
+            _imshow(axes[j], img, f"X c={c} view {v}")
+        out_path = out_dir / f"idx{idx:05d}_X_c{c:02d}_views_{'_'.join(map(str,views))}.png" if save else None
+        _save_or_show(fig, out_path, show)
+
+    # 3) Y channels
+    for c in y_sel:
+        if c < 0 or c >= Cout:
+            continue
+        fig, axes = plt.subplots(1, len(views), figsize=(5 * len(views), 4))
+        if len(views) == 1:
+            axes = [axes]
+        for j, v in enumerate(views):
+            Hc, Wc = _resolve_view_crop(layout, v, H, W)
+            img = np.array(Y[idx, v, c, :Hc, :Wc], dtype=np.float32)
+            if args.apply_mask:
+                img *= mask3[v, :Hc, :Wc]
+            _imshow(axes[j], img, f"Y c={c} view {v}")
+        out_path = out_dir / f"idx{idx:05d}_Y_c{c:02d}_views_{'_'.join(map(str,views))}.png" if save else None
+        _save_or_show(fig, out_path, show)
+
+    # 4) quick diff sanity if te/ti are first two channels (optional)
+    if Cout >= 2:
+        fig, axes = plt.subplots(2, len(views), figsize=(5 * len(views), 7))
+        if len(views) == 1:
+            axes = np.array(axes).reshape(2, 1)
+        for j, v in enumerate(views):
+            Hc, Wc = _resolve_view_crop(layout, v, H, W)
+            te_img = np.array(Y[idx, v, 0, :Hc, :Wc], dtype=np.float32)
+            ti_img = np.array(Y[idx, v, 1, :Hc, :Wc], dtype=np.float32)
+            if args.apply_mask:
+                te_img *= mask3[v, :Hc, :Wc]
+                ti_img *= mask3[v, :Hc, :Wc]
+            _imshow(axes[0, j], te_img, f"Y te (c=0) view {v}")
+            _imshow(axes[1, j], ti_img, f"Y ti (c=1) view {v}")
+        out_path = out_dir / f"idx{idx:05d}_Y_te_ti_views_{'_'.join(map(str,views))}.png" if save else None
+        _save_or_show(fig, out_path, show)
 
 
 if __name__ == "__main__":

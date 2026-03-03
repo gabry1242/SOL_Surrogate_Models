@@ -163,15 +163,21 @@ def main():
     for c in x_sel:
         if c < 0 or c >= Cin:
             continue
-        fig, axes = plt.subplots(1, len(views), figsize=(5 * len(views), 4))
-        if len(views) == 1:
-            axes = [axes]
-        for j, v in enumerate(views):
+        # compute shared scale across all views for this channel
+        all_vals = []
+        for v in views:
             Hc, Wc = _resolve_view_crop(layout, v, H, W)
             img = np.array(X[idx, v, c, :Hc, :Wc], dtype=np.float32)
             if args.apply_mask:
                 img *= mask3[v, :Hc, :Wc]
-            _imshow(axes[j], img, f"X c={c} view {v}")
+            all_vals.append(img)
+        vmin = min(i.min() for i in all_vals)
+        vmax = max(i.max() for i in all_vals)
+        fig, axes = plt.subplots(1, len(views), figsize=(5 * len(views), 4))
+        if len(views) == 1:
+            axes = [axes]
+        for j, v in enumerate(views):
+            _imshow(axes[j], all_vals[j], f"X c={c} view {v}", vmin=vmin, vmax=vmax)
         out_path = out_dir / f"idx{idx:05d}_X_c{c:02d}_views_{'_'.join(map(str,views))}.png" if save else None
         _save_or_show(fig, out_path, show)
 
@@ -179,32 +185,45 @@ def main():
     for c in y_sel:
         if c < 0 or c >= Cout:
             continue
-        fig, axes = plt.subplots(1, len(views), figsize=(5 * len(views), 4))
-        if len(views) == 1:
-            axes = [axes]
-        for j, v in enumerate(views):
+        # compute shared scale across all views for this channel
+        all_vals = []
+        for v in views:
             Hc, Wc = _resolve_view_crop(layout, v, H, W)
             img = np.array(Y[idx, v, c, :Hc, :Wc], dtype=np.float32)
             if args.apply_mask:
                 img *= mask3[v, :Hc, :Wc]
-            _imshow(axes[j], img, f"Y c={c} view {v}")
+            all_vals.append(img)
+        vmin = min(i.min() for i in all_vals)
+        vmax = max(i.max() for i in all_vals)
+        fig, axes = plt.subplots(1, len(views), figsize=(5 * len(views), 4))
+        if len(views) == 1:
+            axes = [axes]
+        for j, v in enumerate(views):
+            _imshow(axes[j], all_vals[j], f"Y c={c} view {v}", vmin=vmin, vmax=vmax)
         out_path = out_dir / f"idx{idx:05d}_Y_c{c:02d}_views_{'_'.join(map(str,views))}.png" if save else None
         _save_or_show(fig, out_path, show)
 
     # 4) quick diff sanity if te/ti are first two channels (optional)
     if Cout >= 2:
-        fig, axes = plt.subplots(2, len(views), figsize=(5 * len(views), 7))
-        if len(views) == 1:
-            axes = np.array(axes).reshape(2, 1)
-        for j, v in enumerate(views):
+        # compute shared scale per row (te and ti separately) across all views
+        te_vals, ti_vals = [], []
+        for v in views:
             Hc, Wc = _resolve_view_crop(layout, v, H, W)
             te_img = np.array(Y[idx, v, 0, :Hc, :Wc], dtype=np.float32)
             ti_img = np.array(Y[idx, v, 1, :Hc, :Wc], dtype=np.float32)
             if args.apply_mask:
                 te_img *= mask3[v, :Hc, :Wc]
                 ti_img *= mask3[v, :Hc, :Wc]
-            _imshow(axes[0, j], te_img, f"Y te (c=0) view {v}")
-            _imshow(axes[1, j], ti_img, f"Y ti (c=1) view {v}")
+            te_vals.append(te_img)
+            ti_vals.append(ti_img)
+        te_vmin, te_vmax = min(i.min() for i in te_vals), max(i.max() for i in te_vals)
+        ti_vmin, ti_vmax = min(i.min() for i in ti_vals), max(i.max() for i in ti_vals)
+        fig, axes = plt.subplots(2, len(views), figsize=(5 * len(views), 7))
+        if len(views) == 1:
+            axes = np.array(axes).reshape(2, 1)
+        for j, v in enumerate(views):
+            _imshow(axes[0, j], te_vals[j], f"Y te (c=0) view {v}", vmin=te_vmin, vmax=te_vmax)
+            _imshow(axes[1, j], ti_vals[j], f"Y ti (c=1) view {v}", vmin=ti_vmin, vmax=ti_vmax)
         out_path = out_dir / f"idx{idx:05d}_Y_te_ti_views_{'_'.join(map(str,views))}.png" if save else None
         _save_or_show(fig, out_path, show)
 

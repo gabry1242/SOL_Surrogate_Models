@@ -298,8 +298,10 @@ class NpyTensor3Dataset(Dataset):
         s_c:       np.ndarray,
         eps:       float = 1e-3,
     ):
-        self.X = np.load(x_path, mmap_mode="r")
-        self.Y = np.load(y_path, mmap_mode="r")
+        print(f"Loading {x_path} into RAM...")
+        self.X = np.load(x_path)
+        print(f"Loading {y_path} into RAM...")
+        self.Y = np.load(y_path)
 
         if self.X.ndim != 5:
             raise ValueError(f"X must be 5D (N,3,C,H,W), got {self.X.shape}.")
@@ -580,11 +582,11 @@ def main() -> None:
     ap.add_argument("--eps",              type=float, default=1e-5)
     ap.add_argument("--prefix",           default="global3")
     # ---- new performance knobs ----
-    ap.add_argument("--num_workers",      type=int,   default=4,
+    ap.add_argument("--num_workers",      type=int,   default=0,
                     help="DataLoader worker processes (0 = main thread only, slow)")
-    ap.add_argument("--eval_train_every", type=int,   default=5,
+    ap.add_argument("--eval_train_every", type=int,   default=1,
                     help="Run full train-set evaluation every N epochs (0 = never)")
-    ap.add_argument("--save_every",       type=int,   default=5,
+    ap.add_argument("--save_every",       type=int,   default=1,
                     help="Save checkpoint_last every N epochs")
     args = ap.parse_args()
 

@@ -2,79 +2,103 @@
 """
 viz_infer_3views.py
 
-Visualize inference results from infer_unet_3inputs.py.
+Visualize inference results from infer_unet_3views.py.
 
 For each selected sample and each output channel, produces one figure with:
-  - 3 rows  : view0 (top), view1 (mid), view2 (bottom)
-  - 3 cols  : Ground Truth | Prediction | Absolute Error
+  - 3 rows : view0 (top) | view1 (mid) | view2 (bottom)
+  - 3 cols : Ground Truth | Prediction | |Absolute Error|
+  Plus per-view MAE and RMSE in subplot titles.
 
-Both pred and ground truth are in physical units (already inverse-transformed
-by infer_unet_3inputs.py).
+Tensor layout (as produced by build_3view_tensors.py + infer_unet_3views.py):
+  Each view has its own 4D file:
+    <tensor_prefix>_view{0,1,2}_X_img_<split>.npy  (N, C_in,  H, W)
+    <tensor_prefix>_view{0,1,2}_Y_img_<split>.npy  (N, C_out, H, W)
+  Predictions (one per view run):
+    <pred_dir_view0>/pred_Y_img_test.npy            (N, C_sel, H, W)
+    <pred_dir_view1>/pred_Y_img_test.npy
+    <pred_dir_view2>/pred_Y_img_test.npy
+  Optional layout metadata (for canvas crop):
+    <tensor_prefix>_layout_map_3views.npz
 
-Loads:
-  <pred_dir>/pred_Y_img_test.npy       (N, 3, C_sel, H, W)  — predictions
-  <tensor_dir>/<prefix>_Y_img_test.npy (N, 3, C_out, H, W)  — ground truth
-  <tensor_dir>/<prefix>_X_img_test.npy (N, 3, C_in,  H, W)  — for mask
-  <tensor_dir>/<prefix>_layout_map_3views.npz                — for crop sizes (optional)
+Usage examples
+--------------
+# Visualize sample 0, all predicted channels, all 3 views:
+python scripts/visualizations/viz_infer_3views.py \
+    --tensor_prefix  scripts/tensor/3views_4d/test/global3v \
+    --tensor_split   test \
+    --pred_view0     scripts/runs/unet_3views/view0/infer_test \
+    --pred_view1     scripts/runs/unet_3views/view1/infer_test \
+    --pred_view2     scripts/runs/unet_3views/view2/infer_test \
+    --out_dir        scripts/runs/unet_3views/viz \
+    --idx            0
 
-Outputs PNGs to <out_dir>/<idx>/<channel_name>.png
+# te and ti only (original channels 0 and 1), samples 0,1,2:
+python scripts/visualizations/viz_infer_3views.py \
+    --tensor_prefix  scripts/tensor/3views_4d/test/global3v \
+    --tensor_split   test \
+    --pred_view0     scripts/runs/unet_3views/view0/infer_test \
+    --pred_view1     scripts/runs/unet_3views/view1/infer_test \
+    --pred_view2     scripts/runs/unet_3views/view2/infer_test \
+    --out_dir        scripts/runs/unet_3views/viz \
+    --idx            0,1,2 \
+    --y_indices      0,1
 
-Usage:
-  python scripts/visualizations/viz_infer_3views.py \
-    --pred_dir   scripts/runs/unet3_width64/infer_test \
-    --tensor_dir scripts/tensor/3images/test \
-    --out_dir    scripts/runs/unet3_width64/infer_test/viz \
-    --prefix     global3 \
-    --idx        0 \
-    --y_indices  0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21
+# Only view0 and view1 (omit --pred_view2 to skip view2):
+python scripts/visualizations/viz_infer_3views.py \
+    --tensor_prefix  scripts/tensor/3views_4d/test/global3v \
+    --tensor_split   test \
+    --pred_view0     scripts/runs/unet_3views/view0/infer_test \
+    --pred_view1     scripts/runs/unet_3views/view1/infer_test \
+    --out_dir        scripts/runs/unet_3views/viz \
+    --idx            0
 
-  # visualize multiple samples:
-  --idx 0,1,2,5
-  # visualize all samples in test set:
-  --idx all
+Output layout (under --out_dir)
+--------------------------------
+  idx00000/
+    ch00_te.png
+    ch01_ti.png
+    ...
+  idx00001/
+    ...
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend, safe for servers
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
 
 # ---------------------------------------------------------------------------
-# Channel metadata
+# Channel metadata  (matches train_unet_3views.py ordering)
 # ---------------------------------------------------------------------------
-# Default channel names matching train_unet_3inputs.py ordering:
-#   0: te, 1: ti, 2-11: na (10 species), 12-21: ua (10 species)
 _SPECIES = ["D0", "D1", "N0", "N1", "N2", "N3", "N4", "N5", "N6", "N7"]
 
-DEFAULT_CHANNEL_NAMES = (
+CHANNEL_NAMES = (
     ["te", "ti"]
-    + [f"na_{s}" for s in _SPECIES]
-    + [f"ua_{s}" for s in _SPECIES]
+    + [f"na_{s}" for s in _SPECIES]   # 2..11
+    + [f"ua_{s}" for s in _SPECIES]   # 12..21
+)
+CHANNEL_UNITS = (
+    ["J", "J"]
+    + ["m⁻³"] * 10
+    + ["m/s"]  * 10
 )
 
-DEFAULT_CHANNEL_UNITS = (
-    ["J", "J"]                    # te, ti in Joules (physical units from infer)
-    + ["m⁻³"] * 10                # na
-    + ["m/s"]  * 10                # ua
-)
-
-# Positive channels (te, ti, na) benefit from log-scale display
-# Signed channels (ua) use linear/symlog
-POS_CHANNELS    = set(range(0, 12))
-SIGNED_CHANNELS = set(range(12, 22))
+POS_CHANNELS    = set(range(0, 12))   # te, ti, na  → positive physical quantities
+SIGNED_CHANNELS = set(range(12, 22))  # ua           → can be negative
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 def _parse_idx_list(s: str, N: int) -> List[int]:
     s = s.strip().lower()
     if s == "all":
@@ -89,8 +113,9 @@ def _parse_ch_list(s: str, C: int) -> List[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
-def _load_layout(tensor_dir: Path, prefix: str) -> Optional[dict]:
-    p = tensor_dir / f"{prefix}_layout_map_3views.npz"
+def _load_layout(tensor_prefix: str) -> Optional[Dict]:
+    """Load the shared layout .npz (crop sizes per view)."""
+    p = Path(f"{tensor_prefix}_layout_map_3views.npz")
     if not p.exists():
         return None
     z   = np.load(p, allow_pickle=True)
@@ -101,147 +126,153 @@ def _load_layout(tensor_dir: Path, prefix: str) -> Optional[dict]:
     return out
 
 
-def _view_crop(layout: Optional[dict], view_id: int, H: int, W: int) -> Tuple[int, int]:
+def _view_crop(layout: Optional[Dict], view_id: int, H: int, W: int) -> Tuple[int, int]:
+    """Return (Hcrop, Wcrop) for the valid (non-padded) region of a view canvas."""
     if layout is None:
         return H, W
-    hk = f"H{view_id}"
-    wk = f"W{view_id}"
-    Hc = min(layout[hk], H) if hk in layout else H
-    Wc = min(layout[wk], W) if wk in layout else W
+    Hc = min(layout.get(f"H{view_id}", H), H)
+    Wc = min(layout.get(f"W{view_id}", W), W)
     return Hc, Wc
 
 
-def _get_mask(X: np.ndarray, idx: int) -> np.ndarray:
-    """Returns (3, H, W) float32 mask from X channel 0 per view."""
-    return X[idx, :, 0, :, :].astype(np.float32)
-
-
 def _apply_mask(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """img: (H,W), mask: (H,W) — set gap pixels to NaN for display."""
-    out = img.copy().astype(np.float64)
+    """Set gap/padding pixels to NaN so imshow renders them as blank."""
+    out = img.astype(np.float64)
     out[mask < 0.5] = np.nan
     return out
 
 
-def _colormap_for_channel(orig_c: int) -> str:
-    if orig_c in POS_CHANNELS:
-        return "inferno"
-    return "RdBu_r"
+def _load_y_indices_from_checkpoint(pred_dir: Path) -> Optional[List[int]]:
+    """Try to read y_indices stored inside the companion checkpoint."""
+    for ckpt_name in ("checkpoint_best.pt", "checkpoint_last.pt"):
+        ckpt_path = pred_dir.parent / ckpt_name
+        if ckpt_path.exists():
+            try:
+                import torch
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                ids  = [int(x) for x in ckpt.get("y_indices", [])]
+                if ids:
+                    print(f"  y_indices read from {ckpt_path}: {ids}")
+                    return ids
+            except Exception as e:
+                print(f"  Warning: could not read checkpoint {ckpt_path}: {e}")
+    return None
 
 
-def _norm_for_channel(
-    orig_c: int,
-    gt_img: np.ndarray,
-    pr_img: np.ndarray,
+def _shared_norm(
+    orig_c:   int,
+    gt_imgs:  List[np.ndarray],   # list of (Hc,Wc) arrays (may contain NaN)
+    pr_imgs:  List[np.ndarray],
 ) -> mcolors.Normalize:
-    """
-    Compute a shared colormap normalization from the valid (non-NaN) pixels
-    of both ground truth and prediction.
-    For signed channels uses symmetric limits around zero.
-    """
-    valid = np.concatenate([
-        gt_img[~np.isnan(gt_img)].ravel(),
-        pr_img[~np.isnan(pr_img)].ravel(),
+    """Shared colormap normalisation across all views for one channel."""
+    all_vals = np.concatenate([
+        v[~np.isnan(v)].ravel()
+        for v in gt_imgs + pr_imgs
+        if v is not None and v.size > 0
     ])
-    if valid.size == 0:
+    if all_vals.size == 0:
         return mcolors.Normalize(vmin=0, vmax=1)
 
-    vmin, vmax = float(np.nanmin(valid)), float(np.nanmax(valid))
+    vmin, vmax = float(all_vals.min()), float(all_vals.max())
 
     if orig_c in SIGNED_CHANNELS:
-        # symmetric around zero for velocity fields
-        lim = max(abs(vmin), abs(vmax))
+        lim = max(abs(vmin), abs(vmax), 1e-12)
         return mcolors.Normalize(vmin=-lim, vmax=lim)
 
-    # positive channels: guard against log of zero
-    vmin = max(vmin, 0.0)
-    return mcolors.Normalize(vmin=vmin, vmax=vmax)
+    return mcolors.Normalize(vmin=max(vmin, 0.0), vmax=max(vmax, 1e-12))
 
 
-def _error_norm(err_img: np.ndarray) -> mcolors.Normalize:
-    valid = err_img[~np.isnan(err_img)].ravel()
-    if valid.size == 0:
+def _error_norm(err_imgs: List[np.ndarray]) -> mcolors.Normalize:
+    """Shared error colormap normalisation across all views."""
+    all_vals = np.concatenate([
+        v[~np.isnan(v)].ravel()
+        for v in err_imgs
+        if v is not None and v.size > 0
+    ])
+    if all_vals.size == 0:
         return mcolors.Normalize(vmin=0, vmax=1)
-    return mcolors.Normalize(vmin=0, vmax=float(np.nanpercentile(valid, 98)))
+    return mcolors.Normalize(vmin=0, vmax=float(np.nanpercentile(all_vals, 98)))
+
+
+def _metric_str(
+    gt_crop: np.ndarray, pr_crop: np.ndarray, mask_crop: np.ndarray
+) -> str:
+    valid = mask_crop > 0.5
+    if valid.sum() == 0:
+        return "no valid pixels"
+    diff  = gt_crop[valid] - pr_crop[valid]
+    mae   = float(np.mean(np.abs(diff)))
+    rmse  = float(np.sqrt(np.mean(diff ** 2)))
+    return f"MAE={mae:.3g}  RMSE={rmse:.3g}"
 
 
 # ---------------------------------------------------------------------------
-# Single figure: one channel, one sample, all 3 views
+# Single figure: one channel, one sample, N active views (rows) × 3 cols
 # ---------------------------------------------------------------------------
-VIEW_LABELS = ["View 0 (top)", "View 1 (mid)", "View 2 (bottom)"]
+
+VIEW_LABELS = ["View 0  (top)", "View 1  (mid)", "View 2  (bottom)"]
+
 
 def plot_channel(
-    gt:        np.ndarray,   # (3, H, W)  ground truth, physical units
-    pred:      np.ndarray,   # (3, H, W)  prediction,   physical units
-    mask3:     np.ndarray,   # (3, H, W)  binary mask
-    layout:    Optional[dict],
-    orig_c:    int,          # original channel index (for colormap choice)
-    ch_name:   str,
-    ch_unit:   str,
-    idx:       int,
-    out_path:  Path,
+    active_views: List[int],          # e.g. [0, 1, 2]
+    gt_data:      Dict[int, np.ndarray],   # view_id → (H,W) ground truth
+    pr_data:      Dict[int, np.ndarray],   # view_id → (H,W) prediction
+    mask_data:    Dict[int, np.ndarray],   # view_id → (H,W) mask
+    orig_c:       int,
+    ch_name:      str,
+    ch_unit:      str,
+    idx:          int,
+    out_path:     Path,
 ) -> None:
-    """
-    Produces a 3×3 figure:
-      rows = views (0,1,2)
-      cols = Ground Truth | Prediction | |Error|
-    """
-    n_views = 3
+    n_rows = len(active_views)
     fig, axes = plt.subplots(
-        n_views, 3,
-        figsize=(15, 4 * n_views),
+        n_rows, 3,
+        figsize=(15, 4.2 * n_rows),
         squeeze=False,
     )
     fig.suptitle(
         f"Sample {idx}  |  Channel: {ch_name}  [{ch_unit}]",
-        fontsize=14, fontweight="bold", y=1.01,
+        fontsize=13, fontweight="bold",
     )
 
-    H, W = gt.shape[1], gt.shape[2]
+    # pre-collect masked images for shared normalisation
+    gt_masked  = [_apply_mask(gt_data[v],  mask_data[v]) for v in active_views]
+    pr_masked  = [_apply_mask(pr_data[v],  mask_data[v]) for v in active_views]
+    err_masked = [_apply_mask(np.abs(gt_data[v] - pr_data[v]), mask_data[v])
+                  for v in active_views]
 
-    for v in range(n_views):
-        Hc, Wc = _view_crop(layout, v, H, W)
-        m = mask3[v, :Hc, :Wc]
+    cmap      = "inferno" if orig_c in POS_CHANNELS else "RdBu_r"
+    norm      = _shared_norm(orig_c, gt_masked, pr_masked)
+    err_norm_ = _error_norm(err_masked)
 
-        gt_img   = _apply_mask(gt  [v, :Hc, :Wc], m)
-        pred_img = _apply_mask(pred[v, :Hc, :Wc], m)
-        err_img  = _apply_mask(np.abs(gt[v, :Hc, :Wc] - pred[v, :Hc, :Wc]), m)
+    for row, v in enumerate(active_views):
+        gt_img   = gt_masked[row]
+        pr_img   = pr_masked[row]
+        err_img  = err_masked[row]
+        metrics  = _metric_str(gt_data[v], pr_data[v], mask_data[v])
+        vlabel   = VIEW_LABELS[v] if v < len(VIEW_LABELS) else f"View {v}"
 
-        cmap     = _colormap_for_channel(orig_c)
-        norm     = _norm_for_channel(orig_c, gt_img, pred_img)
-        err_norm = _error_norm(err_img)
-
-        # compute masked MAE for this view/channel
-        valid_mask = m > 0.5
-        if valid_mask.sum() > 0:
-            mae_val  = float(np.nanmean(np.abs(
-                gt[v, :Hc, :Wc][valid_mask] - pred[v, :Hc, :Wc][valid_mask]
-            )))
-            rmse_val = float(np.sqrt(np.nanmean((
-                gt[v, :Hc, :Wc][valid_mask] - pred[v, :Hc, :Wc][valid_mask]
-            ) ** 2)))
-            metric_str = f"MAE={mae_val:.3g}  RMSE={rmse_val:.3g}"
-        else:
-            metric_str = "no valid pixels"
-
-        # --- col 0: ground truth ---
-        ax = axes[v, 0]
-        im = ax.imshow(gt_img, cmap=cmap, norm=norm, origin="upper")
-        ax.set_title(f"{VIEW_LABELS[v]}\nGround Truth", fontsize=9)
+        # col 0 — ground truth
+        ax = axes[row, 0]
+        im = ax.imshow(gt_img, cmap=cmap, norm=norm, origin="upper",
+                       interpolation="nearest")
+        ax.set_title(f"{vlabel}\nGround Truth", fontsize=9)
         ax.axis("off")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-        # --- col 1: prediction ---
-        ax = axes[v, 1]
-        im = ax.imshow(pred_img, cmap=cmap, norm=norm, origin="upper")
-        ax.set_title(f"{VIEW_LABELS[v]}\nPrediction\n{metric_str}", fontsize=9)
+        # col 1 — prediction
+        ax = axes[row, 1]
+        im = ax.imshow(pr_img, cmap=cmap, norm=norm, origin="upper",
+                       interpolation="nearest")
+        ax.set_title(f"{vlabel}\nPrediction\n{metrics}", fontsize=9)
         ax.axis("off")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-        # --- col 2: absolute error ---
-        ax = axes[v, 2]
-        im = ax.imshow(err_img, cmap="hot_r", norm=err_norm, origin="upper")
-        ax.set_title(f"{VIEW_LABELS[v]}\n|Error|", fontsize=9)
+        # col 2 — absolute error
+        ax = axes[row, 2]
+        im = ax.imshow(err_img, cmap="hot_r", norm=err_norm_, origin="upper",
+                       interpolation="nearest")
+        ax.set_title(f"{vlabel}\n|Error|", fontsize=9)
         ax.axis("off")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -249,180 +280,213 @@ def plot_channel(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+    print(f"  saved → {out_path}")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pred_dir",   required=True,
-                    help="Folder containing pred_Y_img_test.npy "
-                         "(output of infer_unet_3inputs.py)")
-    ap.add_argument("--tensor_dir", required=True,
-                    help="Folder containing ground-truth tensors "
-                         "(global3_Y_img_test.npy, global3_X_img_test.npy)")
-    ap.add_argument("--out_dir",    required=True,
-                    help="Where to write PNG figures")
-    ap.add_argument("--prefix",     default="global3",
-                    help="Tensor file prefix (default: global3)")
-    ap.add_argument("--idx",        default="0",
-                    help='Sample indices to visualize: "0", "0,1,5", or "all"')
-    ap.add_argument("--y_indices",  default="all",
-                    help='Which output channels to plot (original channel indices). '
-                         '"all" plots all channels present in pred tensor. '
-                         'e.g. "0,1" for te and ti only.')
-    ap.add_argument("--no_mask",    action="store_true",
-                    help="Do not apply mask (show full canvas including gaps)")
+    ap = argparse.ArgumentParser(
+        description="Visualize per-view UNet inference results (4D tensors)."
+    )
+
+    # ---- tensor paths ----
+    ap.add_argument(
+        "--tensor_prefix", required=True,
+        help=(
+            "Prefix used when building the test tensors with build_3view_tensors.py. "
+            "E.g. scripts/tensor/3views_4d/test/global3v"
+        ),
+    )
+    ap.add_argument("--tensor_split", default="test",
+                    help="Split tag for the ground-truth tensors (default: test).")
+
+    # ---- prediction directories (one per view, all optional) ----
+    ap.add_argument("--pred_view0", default=None,
+                    help="Folder containing view0 pred_Y_img_test.npy "
+                         "(output of infer_unet_3views.py for view 0).")
+    ap.add_argument("--pred_view1", default=None,
+                    help="Folder containing view1 pred_Y_img_test.npy.")
+    ap.add_argument("--pred_view2", default=None,
+                    help="Folder containing view2 pred_Y_img_test.npy.")
+
+    # ---- output ----
+    ap.add_argument("--out_dir", required=True,
+                    help="Directory to write PNG figures.")
+
+    # ---- selection ----
+    ap.add_argument("--idx", default="0",
+                    help='Sample indices: "0", "0,1,5", or "all".')
+    ap.add_argument(
+        "--y_indices", default="all",
+        help=(
+            'Original channel indices to plot, e.g. "0,1" for te+ti, or "all". '
+            'If a view was trained on a subset, only channels present in that '
+            'view\'s checkpoint are plotted for that row.'
+        ),
+    )
+    ap.add_argument("--no_mask", action="store_true",
+                    help="Skip masking (show full padded canvas).")
     args = ap.parse_args()
 
-    pred_dir   = Path(args.pred_dir)
-    tensor_dir = Path(args.tensor_dir)
-    out_dir    = Path(args.out_dir)
-    pfx        = args.prefix
+    # ---- figure out which views are active ----
+    pred_dirs: Dict[int, Path] = {}
+    for v, arg_val in [(0, args.pred_view0),
+                       (1, args.pred_view1),
+                       (2, args.pred_view2)]:
+        if arg_val is not None:
+            pred_dirs[v] = Path(arg_val)
 
-    # ---- load arrays ----
-    pred_path = pred_dir / "pred_Y_img_test.npy"
-    gt_path   = tensor_dir / f"{pfx}_Y_img_test.npy"
-    x_path    = tensor_dir / f"{pfx}_X_img_test.npy"
+    if not pred_dirs:
+        raise ValueError("Provide at least one of --pred_view0 / --pred_view1 / --pred_view2.")
 
-    for p in [pred_path, gt_path, x_path]:
-        if not p.exists():
-            raise FileNotFoundError(f"Required file not found: {p}")
+    layout = _load_layout(args.tensor_prefix)
+    if layout:
+        print(f"Layout loaded: {layout}")
+    else:
+        print("No layout file found — full canvas will be shown without cropping.")
 
-    print("Loading tensors (mmap) …")
-    pred_arr = np.load(pred_path, mmap_mode="r")  # (N, 3, C_sel, H, W)
-    gt_arr   = np.load(gt_path,   mmap_mode="r")  # (N, 3, C_out, H, W)
-    x_arr    = np.load(x_path,    mmap_mode="r")  # (N, 3, C_in,  H, W)
+    # ---- load per-view arrays (mmap) ----
+    # Structure:
+    #   gt_arrs[v]   : (N, C_out, H, W)  ground truth
+    #   x_arrs[v]    : (N, C_in,  H, W)  for mask (channel 0)
+    #   pred_arrs[v] : (N, C_sel, H, W)  model predictions
+    #   y_idx_map[v] : List[int]          orig channel index for each pred channel
 
-    if pred_arr.ndim != 5:
-        raise ValueError(f"pred tensor must be 5D (N,3,C,H,W), got {pred_arr.shape}")
-    if gt_arr.ndim != 5:
-        raise ValueError(f"gt tensor must be 5D (N,3,C,H,W), got {gt_arr.shape}")
+    gt_arrs:   Dict[int, np.ndarray] = {}
+    x_arrs:    Dict[int, np.ndarray] = {}
+    pred_arrs: Dict[int, np.ndarray] = {}
+    y_idx_map: Dict[int, List[int]]  = {}
 
-    N, _, C_sel, H, W = pred_arr.shape
-    C_out_total        = gt_arr.shape[2]
+    for v, pred_dir in pred_dirs.items():
+        view_tag   = f"view{v}"
+        gt_path    = Path(f"{args.tensor_prefix}_{view_tag}_Y_img_{args.tensor_split}.npy")
+        x_path     = Path(f"{args.tensor_prefix}_{view_tag}_X_img_{args.tensor_split}.npy")
+        pred_path  = pred_dir / "pred_Y_img_test.npy"
 
-    layout = _load_layout(tensor_dir, pfx)
+        for p in (gt_path, x_path, pred_path):
+            if not p.exists():
+                raise FileNotFoundError(str(p))
 
-    # ---- resolve sample indices ----
+        print(f"Loading view {v} …")
+        gt_arrs[v]   = np.load(gt_path,   mmap_mode="r")
+        x_arrs[v]    = np.load(x_path,    mmap_mode="r")
+        pred_arrs[v] = np.load(pred_path, mmap_mode="r")
+
+        if pred_arrs[v].ndim != 4:
+            raise ValueError(
+                f"pred_Y_img_test.npy for view {v} must be 4D (N,C,H,W), "
+                f"got {pred_arrs[v].shape}. "
+                "Did you use infer_unet_3views.py?"
+            )
+
+        C_sel = pred_arrs[v].shape[1]
+        # try to read y_indices from companion checkpoint
+        ids = _load_y_indices_from_checkpoint(pred_dir)
+        y_idx_map[v] = ids if ids is not None else list(range(C_sel))
+
+        print(f"  gt:   {gt_arrs[v].shape}")
+        print(f"  pred: {pred_arrs[v].shape}  →  y_indices: {y_idx_map[v]}")
+
+    # ---- N consistency check ----
+    Ns = [arr.shape[0] for arr in pred_arrs.values()]
+    if len(set(Ns)) > 1:
+        raise ValueError(f"Prediction arrays have inconsistent N: { {v: Ns[i] for i,v in enumerate(pred_dirs)} }")
+    N = Ns[0]
+
+    # ---- sample indices ----
     sample_indices = _parse_idx_list(args.idx, N)
     bad = [i for i in sample_indices if i < 0 or i >= N]
     if bad:
-        raise ValueError(f"Sample indices out of range [0,{N-1}]: {bad}")
+        raise ValueError(f"--idx values {bad} out of range [0,{N-1}]")
 
-    # ---- resolve channel indices ----
-    # y_indices here refers to which of the C_sel pred channels to plot,
-    # AND maps back to original channel index for naming/colourmap.
-    # If the user passes original channel indices, we use them directly.
-    # If pred has C_sel < C_out_total, we need to know the mapping.
-    # We read it from the checkpoint if available, otherwise assume 0..C_sel-1.
-    ckpt_y_indices = None
-    ckpt_path_guess = pred_dir.parent / "checkpoint_best.pt"
-    if ckpt_path_guess.exists():
-        try:
-            import torch
-            ckpt = torch.load(ckpt_path_guess, map_location="cpu", weights_only=False)
-            ckpt_y_indices = [int(x) for x in ckpt.get("y_indices", [])]
-            print(f"Loaded y_indices from checkpoint: {ckpt_y_indices}")
-        except Exception as e:
-            print(f"Could not load checkpoint for y_indices: {e}")
+    # ---- determine which original channels to plot ----
+    # Union of all original channels across active views, then filter by --y_indices.
+    all_orig_channels: List[int] = sorted(set(
+        c for ids in y_idx_map.values() for c in ids
+    ))
+    user_filter = _parse_ch_list(args.y_indices, max(all_orig_channels) + 1
+                                  if all_orig_channels else 1)
+    # user_filter interpreted as original channel indices
+    channels_to_plot = [c for c in all_orig_channels if c in set(user_filter)]
 
-    if ckpt_y_indices is None:
-        # assume pred channel j corresponds to original channel j
-        ckpt_y_indices = list(range(C_sel))
-
-    # user filter on top of that
-    user_ch = _parse_ch_list(args.y_indices, len(ckpt_y_indices))
-    # user_ch are indices INTO ckpt_y_indices (i.e. into the C_sel pred axis)
-    # validate
-    bad_ch = [c for c in user_ch if c < 0 or c >= len(ckpt_y_indices)]
-    if bad_ch:
+    if not channels_to_plot:
         raise ValueError(
-            f"--y_indices values {bad_ch} out of range [0,{len(ckpt_y_indices)-1}]"
+            f"No channels to plot after applying --y_indices={args.y_indices}. "
+            f"Available original channels across views: {all_orig_channels}"
         )
 
-    # build channel name/unit lookup
-    ch_names = DEFAULT_CHANNEL_NAMES  # list of 22 names
-    ch_units = DEFAULT_CHANNEL_UNITS  # list of 22 units
+    out_dir    = Path(args.out_dir)
+    active_views = sorted(pred_dirs.keys())
 
-    print(f"\nSamples to visualize : {sample_indices}")
-    print(f"Channels to visualize: {[ckpt_y_indices[j] for j in user_ch]}")
-    print(f"Output directory     : {out_dir}\n")
+    print(f"\nSamples         : {sample_indices}")
+    print(f"Channels to plot: {channels_to_plot}")
+    print(f"Active views    : {active_views}")
+    print(f"Output dir      : {out_dir}\n")
 
-    # ---- main loop ----
-    total_figs = len(sample_indices) * len(user_ch)
+    total_figs = len(sample_indices) * len(channels_to_plot)
     done = 0
 
     for idx in sample_indices:
-        # load this sample's data into RAM (avoid repeated mmap seeks)
-        pred_sample = np.array(pred_arr[idx], dtype=np.float32)  # (3, C_sel, H, W)
-        gt_sample   = np.array(gt_arr  [idx], dtype=np.float32)  # (3, C_out, H, W)
-        mask3       = _get_mask(x_arr, idx)                       # (3, H, W)
-
-        if args.no_mask:
-            mask3 = np.ones_like(mask3)
-
         sample_out = out_dir / f"idx{idx:05d}"
 
-        for j in user_ch:
-            orig_c   = ckpt_y_indices[j]
-            ch_name  = ch_names[orig_c] if orig_c < len(ch_names) else f"ch{orig_c}"
-            ch_unit  = ch_units[orig_c] if orig_c < len(ch_units) else "?"
+        for orig_c in channels_to_plot:
+            ch_name = CHANNEL_NAMES[orig_c] if orig_c < len(CHANNEL_NAMES) else f"ch{orig_c}"
+            ch_unit = CHANNEL_UNITS[orig_c] if orig_c < len(CHANNEL_UNITS) else "?"
 
-            # pred channel j  ↔  gt channel orig_c
-            pred_ch = pred_sample[:, j,      :, :]  # (3, H, W)
-            gt_ch   = gt_sample  [:, orig_c, :, :]  # (3, H, W)
+            # collect per-view data for this (idx, orig_c)
+            gt_data:   Dict[int, np.ndarray] = {}
+            pr_data:   Dict[int, np.ndarray] = {}
+            mask_data: Dict[int, np.ndarray] = {}
+            views_with_channel: List[int]    = []
+
+            for v in active_views:
+                if orig_c not in y_idx_map[v]:
+                    # this view's model wasn't trained on this channel — skip row
+                    continue
+
+                pred_ch_idx = y_idx_map[v].index(orig_c)
+
+                H, W  = gt_arrs[v].shape[2], gt_arrs[v].shape[3]
+                Hc, Wc = _view_crop(layout, v, H, W)
+
+                gt_crop   = np.array(gt_arrs[v]  [idx, orig_c,     :Hc, :Wc], dtype=np.float32)
+                pr_crop   = np.array(pred_arrs[v] [idx, pred_ch_idx,:Hc, :Wc], dtype=np.float32)
+                mask_crop = np.array(x_arrs[v]    [idx, 0,          :Hc, :Wc], dtype=np.float32)
+
+                if args.no_mask:
+                    mask_crop = np.ones_like(mask_crop)
+
+                gt_data[v]   = gt_crop
+                pr_data[v]   = pr_crop
+                mask_data[v] = mask_crop
+                views_with_channel.append(v)
+
+            if not views_with_channel:
+                print(f"  [skip] idx={idx} ch={orig_c} ({ch_name}): no view has this channel")
+                continue
 
             out_path = sample_out / f"ch{orig_c:02d}_{ch_name}.png"
+            print(f"[{done+1:3d}/{total_figs}] idx={idx}  ch={orig_c} ({ch_name})"
+                  f"  views={views_with_channel}")
 
             plot_channel(
-                gt=gt_ch,
-                pred=pred_ch,
-                mask3=mask3,
-                layout=layout,
+                active_views=views_with_channel,
+                gt_data=gt_data,
+                pr_data=pr_data,
+                mask_data=mask_data,
                 orig_c=orig_c,
                 ch_name=ch_name,
                 ch_unit=ch_unit,
                 idx=idx,
                 out_path=out_path,
             )
-
             done += 1
-            print(f"[{done:3d}/{total_figs}] idx={idx}  ch={orig_c} ({ch_name})  → {out_path}")
 
     print(f"\nDone. {done} figures saved to {out_dir}")
 
 
 if __name__ == "__main__":
     main()
-
-# ---------------------------------------------------------------------------
-# Example commands:
-#
-# Visualize sample 0, all 22 channels:
-#   python scripts/visualizations/viz_infer_3views.py \
-#     --pred_dir   scripts/runs/unet3_width64/infer_test \
-#     --tensor_dir scripts/tensor/3images/test \
-#     --out_dir    scripts/runs/unet3_width64/infer_test/viz \
-#     --prefix     global3 \
-#     --idx        0
-#
-# Visualize samples 0,1,2 — te and ti only (channels 0,1):
-#   python scripts/visualizations/viz_infer_3views.py \
-#     --pred_dir   scripts/runs/unet3_width64/infer_test \
-#     --tensor_dir scripts/tensor/3images/test \
-#     --out_dir    scripts/runs/unet3_width64/infer_test/viz \
-#     --prefix     global3 \
-#     --idx        0,1,2 \
-#     --y_indices  0,1
-#
-# Visualize all test samples (warning: generates N*22 figures):
-#   python scripts/visualizations/viz_infer_3views.py \
-#     --pred_dir   scripts/runs/unet3_width64/infer_test \
-#     --tensor_dir scripts/tensor/3images/test \
-#     --out_dir    scripts/runs/unet3_width64/infer_test/viz \
-#     --prefix     global3 \
-#     --idx        all \
-#     --y_indices  0,1
-# ---------------------------------------------------------------------------

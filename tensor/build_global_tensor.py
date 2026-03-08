@@ -47,8 +47,8 @@ SLOT_TO_SPECNAME = {
 # Fixed transforms per slot
 # -----------------------
 SLOT_TF = {
-    "TOP_left": "R180",
-    "TOP_right": "R180",
+    "TOP_left": "I",
+    "TOP_right": "I",
     "MID_left": "I",
     "MID_right": "I",
     "MID_center": "I",

@@ -98,13 +98,14 @@ def get_mask(pfx, view, split, N):
 # Plot functions
 # ═══════════════════════════════════════════════════════════════════════════
 
-def plot_compare(pred, truth, mask, idx, layout, view, out_dir):
-    """Side-by-side truth vs prediction for Te and Ti."""
+def plot_compare(pred, truth, mask, idx, layout, view, out_dir, channels):
+    """Side-by-side truth vs prediction."""
     H, W = pred.shape[-2:]
     Hc, Wc = crop_hw(layout, view, H, W)
     m = mask[idx, 0, :Hc, :Wc]
 
-    for c in range(2):
+    for c in channels:
+        if c >= pred.shape[1] or c >= truth.shape[1]: continue
         t_img = truth[idx, c, :Hc, :Wc] * m
         p_img = pred[idx, c, :Hc, :Wc] * m
         valid = t_img[m > 0.5]
@@ -123,13 +124,14 @@ def plot_compare(pred, truth, mask, idx, layout, view, out_dir):
         save_fig(fig, out_dir / f"compare_v{view}_idx{idx}_{CH[c]}.png")
 
 
-def plot_error(pred, truth, mask, idx, layout, view, out_dir):
-    """Truth | Prediction | |Error| for Te and Ti."""
+def plot_error(pred, truth, mask, idx, layout, view, out_dir, channels):
+    """Truth | Prediction | |Error|."""
     H, W = pred.shape[-2:]
     Hc, Wc = crop_hw(layout, view, H, W)
     m = mask[idx, 0, :Hc, :Wc]
 
-    for c in range(2):
+    for c in channels:
+        if c >= pred.shape[1] or c >= truth.shape[1]: continue
         t_img = truth[idx, c, :Hc, :Wc] * m
         p_img = pred[idx, c, :Hc, :Wc] * m
         err = np.abs(p_img - t_img) * m
@@ -153,13 +155,14 @@ def plot_error(pred, truth, mask, idx, layout, view, out_dir):
         save_fig(fig, out_dir / f"error_v{view}_idx{idx}_{CH[c]}.png")
 
 
-def plot_uncertainty(std_arr, mask, idx, layout, view, out_dir):
+def plot_uncertainty(std_arr, mask, idx, layout, view, out_dir, channels):
     """Per-pixel std across samples."""
     H, W = std_arr.shape[-2:]
     Hc, Wc = crop_hw(layout, view, H, W)
     m = mask[idx, 0, :Hc, :Wc]
 
-    for c in range(2):
+    for c in channels:
+        if c >= std_arr.shape[1]: continue
         s_img = std_arr[idx, c, :Hc, :Wc] * m
         fig, ax = plt.subplots(figsize=(9, 5))
         im = ax.imshow(s_img, cmap="magma", aspect="auto")
@@ -261,6 +264,9 @@ def main():
                     help="Which view (0,1,2). Use -1 for all views.")
     ap.add_argument("--idx", type=int, default=0,
                     help="Simulation index to visualize")
+    ap.add_argument("--channels", default=None,
+                    help='Which channels to plot, e.g. "0" for Te, "1" for Ti, "0,1" for both. '
+                         'Default: auto-detect from prediction file.')
     ap.add_argument("--out_dir", default=None,
                     help="Output directory for PNGs (default: run_dir/viz or infer_dir/viz)")
     args = ap.parse_args()
@@ -296,15 +302,21 @@ def main():
                 mask = get_mask(args.tensor_prefix, view, args.split, pred.shape[0]) \
                     if args.tensor_prefix else np.ones((pred.shape[0],1,pred.shape[2],pred.shape[3]))
 
+                # Determine which channels to plot
+                if args.channels is not None:
+                    channels = [int(c.strip()) for c in args.channels.split(",") if c.strip()]
+                else:
+                    channels = list(range(pred.shape[1]))  # auto-detect from file
+
                 if mode == "compare" and truth_path.exists():
                     truth = np.load(truth_path, mmap_mode="r")
-                    plot_compare(pred, truth, mask, args.idx, layout, view, out_dir)
+                    plot_compare(pred, truth, mask, args.idx, layout, view, out_dir, channels)
                 elif mode == "error" and truth_path.exists():
                     truth = np.load(truth_path, mmap_mode="r")
-                    plot_error(pred, truth, mask, args.idx, layout, view, out_dir)
+                    plot_error(pred, truth, mask, args.idx, layout, view, out_dir, channels)
                 elif mode == "uncertainty" and std_path.exists():
                     std_arr = np.load(std_path, mmap_mode="r")
-                    plot_uncertainty(std_arr, mask, args.idx, layout, view, out_dir)
+                    plot_uncertainty(std_arr, mask, args.idx, layout, view, out_dir, channels)
                 elif mode == "uncertainty":
                     print(f"  view{view}: no std file found (run inference with --n_samples > 1)")
 

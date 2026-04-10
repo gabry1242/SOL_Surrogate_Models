@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""
+train_fm_full22.py — Flow Matching on FULL 22 channels
+
+Predicts:
+  Te, Ti
+  10 species densities (na_*)
+  10 species velocities (ua_*)
+
+Output shape:
+  (N, 22, H, W)
+"""
+
+from __future__ import annotations
+
+import argparse, json, math
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Channel names (22 total)
+# ═══════════════════════════════════════════════════════════════════════════
+
+SPECIES = ["D0","D1","N0","N1","N2","N3","N4","N5","N6","N7"]
+
+CH_NAMES = (
+    ["Te", "Ti"]
+    + [f"na_{s}" for s in SPECIES]
+    + [f"ua_{s}" for s in SPECIES]
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Dataset (FULL Y, no slicing)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ViewDataset(Dataset):
+    def __init__(self, x_path: Path, y_path: Path):
+        self.X = np.load(x_path, mmap_mode="r")
+        self.Y = np.load(y_path, mmap_mode="r")
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx):
+        x = torch.from_numpy(np.array(self.X[idx], dtype=np.float32))
+        y = torch.from_numpy(np.array(self.Y[idx], dtype=np.float32))  # (22,H,W)
+
+        # simple mask from geometry channel
+        m = (x[0:1] > 0.5).float()
+
+        return x, y, m
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Model (UNCHANGED ARCHITECTURE)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SinusoidalTimeEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        half = dim // 2
+        freq = torch.exp(-math.log(10000.0) * torch.arange(half) / half)
+        self.register_buffer("freq", freq)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim*4),
+            nn.SiLU(),
+            nn.Linear(dim*4, dim)
+        )
+
+    def forward(self, t):
+        t = t.view(-1).float()
+        a = t[:, None] * self.freq[None, :]
+        emb = torch.cat([a.sin(), a.cos()], -1)
+        return self.mlp(emb)
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, ci, co):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(ci, co, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(co, co, 3, padding=1),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class FiLMBlock(nn.Module):
+    def __init__(self, ci, co, t_dim):
+        super().__init__()
+        self.c1 = nn.Conv2d(ci, co, 3, padding=1)
+        self.c2 = nn.Conv2d(co, co, 3, padding=1)
+        self.act = nn.GELU()
+        self.film = nn.Linear(t_dim, co * 2)
+
+    def forward(self, x, t_emb):
+        h = self.act(self.c1(x))
+        h = self.act(self.c2(h))
+        s, b = self.film(t_emb).chunk(2, -1)
+        return h * (1 + s[..., None, None]) + b[..., None, None]
+
+
+class CondEncoder(nn.Module):
+    def __init__(self, c_in, base):
+        super().__init__()
+        self.e1 = ConvBlock(c_in, base)
+        self.e2 = ConvBlock(base, base*2)
+        self.e3 = ConvBlock(base*2, base*4)
+        self.pool = nn.MaxPool2d(2)
+
+    def forward(self, x):
+        f1 = self.e1(x)
+        f2 = self.e2(self.pool(f1))
+        f3 = self.e3(self.pool(f2))
+        return f1, f2, f3
+
+
+class VelocityUNet(nn.Module):
+    def __init__(self, c_in, c_out, base=64, t_dim=128):
+        super().__init__()
+
+        self.time_emb = SinusoidalTimeEmb(t_dim)
+        self.cond_enc = CondEncoder(c_in, base)
+
+        self.enc1 = ConvBlock(c_in + c_out, base)
+        self.enc2 = ConvBlock(base, base*2)
+        self.enc3 = ConvBlock(base*2, base*4)
+
+        self.pool = nn.MaxPool2d(2)
+        self.bottleneck = ConvBlock(base*4, base*8)
+
+        self.up3 = nn.Conv2d(base*8, base*4, 1)
+        self.dec3 = FiLMBlock(base*12, base*4, t_dim)
+
+        self.up2 = nn.Conv2d(base*4, base*2, 1)
+        self.dec2 = FiLMBlock(base*6, base*2, t_dim)
+
+        self.up1 = nn.Conv2d(base*2, base, 1)
+        self.dec1 = FiLMBlock(base*3, base, t_dim)
+
+        self.out = nn.Conv2d(base, c_out, 1)
+
+    def forward(self, x_cond, y_t, t):
+        te = self.time_emb(t)
+
+        c1, c2, c3 = self.cond_enc(x_cond)
+
+        inp = torch.cat([x_cond, y_t], 1)
+
+        e1 = self.enc1(inp)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        b  = self.bottleneck(self.pool(e3))
+
+        u3 = self.up3(F.interpolate(b, e3.shape[-2:], mode="bilinear", align_corners=False))
+        d3 = self.dec3(torch.cat([u3, e3, c3], 1), te)
+
+        u2 = self.up2(F.interpolate(d3, e2.shape[-2:], mode="bilinear", align_corners=False))
+        d2 = self.dec2(torch.cat([u2, e2, c2], 1), te)
+
+        u1 = self.up1(F.interpolate(d2, e1.shape[-2:], mode="bilinear", align_corners=False))
+        d1 = self.dec1(torch.cat([u1, e1, c1], 1), te)
+
+        return self.out(d1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Loss
+# ═══════════════════════════════════════════════════════════════════════════
+
+def masked_mse(pred, target, mask):
+    if mask.shape[1] == 1:
+        mask = mask.expand_as(pred)
+    return ((pred - target) ** 2 * mask).sum() / mask.sum().clamp_min(1e-8)
+
+
+def masked_mae(pred, target, mask):
+    if mask.shape[1] == 1:
+        mask = mask.expand_as(pred)
+    return ((pred - target).abs() * mask).sum((0,2,3)) / mask.sum((0,2,3)).clamp_min(1e-8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════════
+
+def set_seed(s):
+    torch.manual_seed(s)
+    np.random.seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+
+
+def save_json(path, obj):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Plot (FULL 22 CHANNELS)
+# ═══════════════════════════════════════════════════════════════════════════
+
+import matplotlib.pyplot as plt
+
+@torch.no_grad()
+def plot_prediction(model, x, y_true, mask, device, title="full_22"):
+    model.eval()
+
+    x = x.to(device)
+    y_true = y_true.to(device)
+    mask = mask.to(device)
+
+    # initialize noise
+    y = 0.01 * torch.randn_like(y_true)
+
+    steps = 100
+    dt = 1.0 / steps
+
+    for s in range(steps):
+        t = torch.full((x.shape[0],), s / steps, device=device)
+        v = model(x, y, t)
+        y = y + v * dt
+        y = y * mask
+
+    y_pred = y
+
+    y_true = y_true.squeeze(0).cpu().numpy()
+    y_pred = y_pred.squeeze(0).cpu().numpy()
+
+    err = np.abs(y_true - y_pred)
+
+    n_ch = y_true.shape[0]
+
+    for c in range(n_ch):
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+        gt = y_true[c]
+        pr = y_pred[c]
+        er = err[c]
+
+        vmin = min(gt.min(), pr.min())
+        vmax = max(gt.max(), pr.max())
+
+        im0 = axes[0].imshow(gt, vmin=vmin, vmax=vmax)
+        axes[0].set_title(f"GT | {CH_NAMES[c]}")
+        plt.colorbar(im0, ax=axes[0], fraction=0.046)
+
+        im1 = axes[1].imshow(pr, vmin=vmin, vmax=vmax)
+        axes[1].set_title("Prediction")
+        plt.colorbar(im1, ax=axes[1], fraction=0.046)
+
+        im2 = axes[2].imshow(er, cmap="inferno")
+        axes[2].set_title("Absolute Error")
+        plt.colorbar(im2, ax=axes[2], fraction=0.046)
+
+        fig.suptitle(f"Channel {c}: {CH_NAMES[c]}")
+        plt.tight_layout()
+        plt.show()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tensor_prefix", required=True)
+    ap.add_argument("--run_dir", required=True)
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--base", type=int, default=64)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--train_split", default="train")
+    ap.add_argument("--test_split", default="test")
+    args = ap.parse_args()
+
+    set_seed(42)
+
+    device = torch.device(args.device)
+    run_dir = Path(args.run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    pfx = args.tensor_prefix
+
+    # ── Load datasets ──
+    def load_ds(split, view):
+        xp = Path(f"{pfx}_view{view}_X_{split}.npy")
+        yp = Path(f"{pfx}_view{view}_Y_{split}.npy")
+        if not xp.exists(): raise FileNotFoundError(str(xp))
+        return ViewDataset(xp, yp)
+
+    train_ds = ConcatDataset([load_ds(args.train_split, v) for v in range(3)])
+    test_ds  = ConcatDataset([load_ds(args.test_split, v) for v in range(3)])
+
+    train_ds = torch.utils.data.Subset(train_ds, [0])
+    test_ds  = torch.utils.data.Subset(test_ds, [0])
+
+    pin = device.type == "cuda"
+
+    x0, y0, m0 = train_ds[0]
+    c_in = x0.shape[0]
+    c_out = y0.shape[0]   # = 22
+
+    model = VelocityUNet(c_in, c_out, args.base).to(device)
+    opt = optim.AdamW(model.parameters(), lr=args.lr)
+
+    x = x0.unsqueeze(0).to(device)
+    y = y0.unsqueeze(0).to(device)
+    m = m0.unsqueeze(0).to(device)
+
+    for epoch in range(args.epochs):
+        model.train()
+
+        B = 4
+        t = torch.rand(B, device=device)
+
+        x_b = x.expand(B, -1, -1, -1)
+        y1 = y.expand(B, -1, -1, -1)
+        m_b = m.expand(B, -1, -1, -1)
+
+        y0_noise = torch.randn_like(y1) * 0.1
+
+        yt = (1-t[:,None,None,None]) * y0_noise + t[:,None,None,None] * y1
+        vt = (y1 - y0_noise)
+
+        v_pred = model(x_b, yt, t)
+
+        loss = masked_mse(v_pred, vt, m_b)
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        print(f"Epoch {epoch} | loss {loss.item():.6f}")
+
+    plot_prediction(
+        model,
+        x,
+        y,
+        m,
+        device,
+        title="Full 22-channel result"
+    )
+
+
+if __name__ == "__main__":
+    main()

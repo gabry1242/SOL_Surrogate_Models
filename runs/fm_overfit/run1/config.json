@@ -1,0 +1,16 @@
+{
+  "arch": "fm_unet_shared",
+  "tensor_prefix": "scripts/tensor/fm3v/global3v",
+  "c_in": 9,
+  "c_out": 22,
+  "base": 64,
+  "t_dim": 128,
+  "epochs": 1000,
+  "batch_size": 1,
+  "lr": 0.0003,
+  "weight_decay": 0.0001,
+  "seed": 42,
+  "n_params": 9369046,
+  "eval_every": 5,
+  "eval_steps": 50
+}

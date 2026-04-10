@@ -1,0 +1,21 @@
+{
+  "mode": "multiview_single_sample_overfit",
+  "arch": "fm_unet_shared",
+  "tensor_prefix": "scripts/tensor/fm3v/global3v",
+  "sample_idx": 0,
+  "c_in": 9,
+  "c_out": 22,
+  "base": 64,
+  "t_dim": 128,
+  "epochs": 10000,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "seed": 42,
+  "n_params": 9369046,
+  "num_views": 3,
+  "view_ids": [
+    0,
+    1,
+    2
+  ]
+}

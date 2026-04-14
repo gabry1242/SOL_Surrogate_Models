@@ -1,0 +1,23 @@
+{
+  "mode": "overfit_fixed_noise_bank",
+  "sim_idx": 0,
+  "split": "train",
+  "y_channels": [
+    0,
+    1
+  ],
+  "ch_names": [
+    "Te",
+    "Ti"
+  ],
+  "tensor_prefix": "scripts/tensor/fm3v/global3v",
+  "c_in": 9,
+  "c_out": 2,
+  "base": 64,
+  "t_dim": 128,
+  "epochs": 1000,
+  "lr": 0.001,
+  "noise_bank": 20,
+  "seed": 42,
+  "n_params": 9356226
+}

@@ -40,20 +40,34 @@ from torch.utils.data import DataLoader, Dataset, ConcatDataset
 
 Y_CHANNELS = [0, 1]  # Te, Ti
 
-class ViewDataset(Dataset):
-    def __init__(self, x_path: Path, y_path: Path):
-        self.X = np.load(x_path, mmap_mode="r")   # (N, 9, H, W)
-        self.Y = np.load(y_path, mmap_mode="r")   # (N, 22, H, W)
+# ─────────────────────────────────────────────────────────────
+# Single-sample 3-view dataset
+# ─────────────────────────────────────────────────────────────
 
-    def __len__(self): return self.X.shape[0]
+class SingleSample3ViewDataset(Dataset):
+    def __init__(self, tensor_prefix, split="train", sample_idx=0):
+        self.views = []
+
+        for v in range(3):
+            xp = Path(f"{tensor_prefix}_view{v}_X_{split}.npy")
+            yp = Path(f"{tensor_prefix}_view{v}_Y_{split}.npy")
+
+            X = np.load(xp, mmap_mode="r")
+            Y = np.load(yp, mmap_mode="r")
+
+            x = torch.from_numpy(np.array(X[sample_idx], dtype=np.float32))
+            y_full = np.array(Y[sample_idx], dtype=np.float32)
+            y = torch.from_numpy(y_full[Y_CHANNELS])
+
+            m = (x[0:1] > 0.5).float()
+
+            self.views.append((x, y, m))
+
+    def __len__(self):
+        return 1  # only one sample
 
     def __getitem__(self, idx):
-        x = torch.from_numpy(np.array(self.X[idx], dtype=np.float32))
-        y_full = np.array(self.Y[idx], dtype=np.float32)
-        y = torch.from_numpy(y_full[Y_CHANNELS])  # (2, H, W)
-        m = (x[0:1] > 0.5).float()
-        return x, y, m
-
+        return self.views  # list of 3 views
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Model (identical architecture, just c_out=2)
@@ -162,11 +176,9 @@ class VelocityUNet(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def masked_mse(pred, target, mask):
-    if mask.shape[1] == 1:
-        mask = mask.expand_as(pred)
-
-    loss = (pred - target).pow(2) * mask
-    return loss.sum() / mask.sum().clamp_min(1e-8)
+    if mask.shape[1] == 1: mask = mask.expand_as(pred)
+    return ((pred - target).pow(2) * mask).sum((0,2,3)).div(
+        mask.sum((0,2,3)).clamp_min(1e-8)).mean()
 
 def masked_mae_ch(pred, target, mask):
     if mask.shape[1] == 1: mask = mask.expand_as(pred)
@@ -179,12 +191,13 @@ def masked_rmse_ch(pred, target, mask):
         mask.sum((0,2,3)).clamp_min(1e-8))).sqrt()
 
 @torch.no_grad()
-def euler_sample_single(model, x, y0, mask, steps=50, device="cpu"):
-    y = y0.clone().to(device)
+def euler_sample(model, x, mask, steps=50, device="cpu"):
+    B, _, H, W = x.shape
+    y = torch.randn(B, model.c_out, H, W, device=device) * mask
     dt = 1.0 / steps
     model.eval()
     for s in range(steps):
-        t = torch.full((x.shape[0],), s / steps, device=device)
+        t = torch.full((B,), s / steps, device=device)
         y = (y + model(x, y, t) * dt) * mask
     return y
 
@@ -193,9 +206,8 @@ def evaluate(model, loader, device, steps=50):
     model.eval()
     mae_sum = rmse_sum = None; n = 0
     for x, y, m in loader:
-        x, y, m = next(iter(loader))
         x, y, m = x.to(device), y.to(device), m.to(device)
-        pred = euler_sample_single(model, x, 0.03*torch.randn_like(y), m, steps=50, device=device)
+        pred = euler_sample(model, x, m, steps, device)
         mae = masked_mae_ch(pred, y, m).cpu()
         rmse = masked_rmse_ch(pred, y, m).cpu()
         mae_sum  = mae  if mae_sum  is None else mae_sum  + mae
@@ -220,142 +232,6 @@ def save_json(path, obj):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f: json.dump(obj, f, indent=2)
 
-def load_norm_stats(meta_path):
-    meta = np.load(meta_path)
-    mean = torch.from_numpy(meta["mean"]).float()
-    std  = torch.from_numpy(meta["std"]).float()
-    return mean, std
-
-
-import matplotlib.pyplot as plt
-import torch
-
-@torch.no_grad()
-def plot_prediction_physical(model, x, y_true, mask, device, meta_path, title="prediction_physical"):
-    model.eval()
-
-    # ── load normalization stats ──
-    mean, std = load_norm_stats(meta_path)
-
-    # select only Te/Ti channels
-    mean = mean[Y_CHANNELS].to(device)[:, None, None]
-    std  = std[Y_CHANNELS].to(device)[:, None, None]
-
-    x = x.to(device)
-    y_true = y_true.to(device)
-    mask = mask.to(device)
-
-    # ── sample ──
-    y = 0.01 * torch.randn_like(y_true)
-
-    steps = 100
-    dt = 1.0 / steps
-
-    for s in range(steps):
-        t = torch.full((x.shape[0],), s / steps, device=device)
-        v = model(x, y, t)
-        y = y + v * dt
-        y = y * mask
-
-    y_pred = y
-
-    # ── unnormalize ──
-    def to_physical(y):
-        y_denorm = y * std + mean
-        return torch.exp(y_denorm)
-
-    y_true_phys = to_physical(y_true)
-    y_pred_phys = to_physical(y_pred)
-
-    # ── to numpy ──
-    y_true = y_true.squeeze().cpu().numpy()
-    y_pred = y_pred.squeeze().cpu().numpy()
-
-    y_true_phys = y_true_phys.squeeze().cpu().numpy()
-    y_pred_phys = y_pred_phys.squeeze().cpu().numpy()
-
-    n_ch = y_true.shape[0]
-
-    fig, axes = plt.subplots(n_ch, 4, figsize=(16, 4 * n_ch))
-
-    if n_ch == 1:
-        axes = [axes]
-
-    for c in range(n_ch):
-        # normalized
-        axes[c][0].imshow(y_true[c])
-        axes[c][0].set_title(f"GT norm {c}")
-
-        axes[c][1].imshow(y_pred[c])
-        axes[c][1].set_title(f"Pred norm {c}")
-
-        # physical
-        im2 = axes[c][2].imshow(y_true_phys[c])
-        axes[c][2].set_title(f"GT eV {c}")
-        plt.colorbar(im2, ax=axes[c][2])
-
-        im3 = axes[c][3].imshow(y_pred_phys[c])
-        axes[c][3].set_title(f"Pred eV {c}")
-        plt.colorbar(im3, ax=axes[c][3])
-
-    plt.suptitle(title)
-    plt.tight_layout()
-    plt.show()
-
-@torch.no_grad()
-def plot_prediction(model, x, y_true, mask, device, title="overfit_result"):
-    model.eval()
-
-    x = x.to(device)
-    y_true = y_true.to(device)
-    mask = mask.to(device)
-
-    # initialize from noise (same as training idea)
-    y = 0.01 * torch.randn_like(y_true)
-
-    # simple Euler rollout (same as your sampling)
-    steps = 100
-    dt = 1.0 / steps
-
-    for s in range(steps):
-        t = torch.full((x.shape[0],), s / steps, device=device)
-        v = model(x, y, t)
-        y = y + v * dt
-        y = y * mask
-
-    y_pred = y
-
-    # move to CPU for plotting
-    y_true = y_true.squeeze().cpu().numpy()
-    y_pred = y_pred.squeeze().cpu().numpy()
-
-    n_ch = y_true.shape[0]
-
-    fig, axes = plt.subplots(n_ch, 3, figsize=(12, 4 * n_ch))
-
-    if n_ch == 1:
-        axes = [axes]
-
-    for c in range(n_ch):
-        gt = y_true[c]
-        pred = y_pred[c]
-        err = abs(gt - pred)
-
-        im0 = axes[c][0].imshow(gt)
-        axes[c][0].set_title(f"GT channel {c}")
-        plt.colorbar(im0, ax=axes[c][0])
-
-        im1 = axes[c][1].imshow(pred)
-        axes[c][1].set_title(f"Pred channel {c}")
-        plt.colorbar(im1, ax=axes[c][1])
-
-        im2 = axes[c][2].imshow(err)
-        axes[c][2].set_title(f"Abs error {c}")
-        plt.colorbar(im2, ax=axes[c][2])
-
-    plt.suptitle(title)
-    plt.tight_layout()
-    plt.show()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main
@@ -385,29 +261,23 @@ def main():
     device = torch.device(args.device)
 
     # ── Load datasets ──
-    def load_ds(split, view):
-        xp = Path(f"{pfx}_view{view}_X_{split}.npy")
-        yp = Path(f"{pfx}_view{view}_Y_{split}.npy")
-        if not xp.exists(): raise FileNotFoundError(str(xp))
-        return ViewDataset(xp, yp)
 
-    train_ds = ConcatDataset([load_ds(args.train_split, v) for v in range(3)])
-    test_ds  = ConcatDataset([load_ds(args.test_split, v) for v in range(3)])
 
-    train_ds = torch.utils.data.Subset(train_ds, [0])
-    test_ds  = torch.utils.data.Subset(test_ds, [0])
+    train_ds = SingleSample3ViewDataset(
+        tensor_prefix=args.tensor_prefix,
+        split=args.train_split,
+        sample_idx=0
+    )
 
-    pin = device.type == "cuda"
-    train_dl = DataLoader(train_ds, args.batch_size, shuffle=True, num_workers=0, pin_memory=pin)
-    test_dl  = DataLoader(test_ds, args.batch_size, shuffle=False, num_workers=0, pin_memory=pin)
-
-    x0, y0, m0 = train_ds[0]
+    train_dl = DataLoader(train_ds, batch_size=1, shuffle=False)
+    views0 = train_ds[0]        # list of 3 views
+    x0, y0, m0 = views0[0]  
     c_in  = x0.shape[0]   # 9
     c_out = y0.shape[0]   # 2 (Te, Ti)
 
     print(f"\n{'='*60}")
     print(f"Flow Matching — Te + Ti only")
-    print(f"  Train: {len(train_ds)} samples  |  Test: {len(test_ds)} samples")
+
     print(f"  c_in={c_in}  c_out={c_out}  canvas={x0.shape[1]}x{x0.shape[2]}")
     print(f"  Y channels: {Y_CHANNELS} (Te, Ti)")
     print(f"{'='*60}")
@@ -433,109 +303,99 @@ def main():
     best_rmse = float("inf")
     hist = {"train": [], "test": []}
 
-    fixed_y0 = (torch.randn_like(y0)).to(device).unsqueeze(0)
-
-    x = x0.to(device).unsqueeze(0)
-    y1 = y0.to(device).unsqueeze(0)
-    m = m0.to(device).unsqueeze(0)
-
     for epoch in range(1, args.epochs + 1):
         model.train()
+        loss_sum = 0.0
 
-        B = 8  # or 16
+        for views in train_dl:
+            views = views[0]  # VERY IMPORTANT
 
-        t = torch.rand(B, device=device)
-        t = t[:, None, None, None]
+            X, Y, M = views  # tensors with shape (3, ...)
 
-        y1_b = y1.expand(B, -1, -1, -1)
-        x_b  = x.expand(B, -1, -1, -1)
-        m_b  = m.expand(B, -1, -1, -1)
+            total_loss = 0.0
 
-        # 🔥 resample noise
-        y_init = torch.randn_like(y1_b) * 0.1
+            for i in range(3):
+                x = X[i:i+1].to(device)
+                y1 = Y[i:i+1].to(device)
+                m = M[i:i+1].to(device)
 
-        yt = ((1 - t) * y_init + t * y1_b) * m_b
-        v_target = (y1_b - y_init) * m_b
+                B = x.shape[0]
 
-        v_pred = model(x_b, yt, t.squeeze())
+                t = torch.rand(B, device=device)
+                y0 = torch.randn_like(y1) * m
+                t_e = t.view(B, 1, 1, 1)
 
-        v_pred = v_pred * m_b   # 🔥 CRITICAL
+                yt = ((1 - t_e) * y0 + t_e * y1) * m
+                v_target = (y1 - y0) * m
 
-        loss = masked_mse(v_pred, v_target, m_b)
+                v_pred = model(x, yt, t) * m
+                loss = masked_mse(v_pred, v_target, m)
 
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+                total_loss += loss
 
-        # ── metrics ──
-        with torch.no_grad():
-            mae_ch = masked_mae_ch(v_pred, v_target, m)   # (2,)
-            rmse_ch = masked_rmse_ch(v_pred, v_target, m) # (2,)
+            total_loss = total_loss / 3.0
 
-            rmse = rmse_ch.mean().item()
+            opt.zero_grad(set_to_none=True)
+            total_loss.backward()
+            opt.step()
 
-            v_err = (v_pred - v_target).abs().mean().item()
+            loss_sum += total_loss.item()
+        # scheduler.step()
+        print(f"Epoch {epoch:03d} | loss={loss_sum:.6f}")
+    
+    import matplotlib.pyplot as plt
 
-        # ── logging dict ──
-        log_entry = {
-            "epoch": epoch,
-            "loss": loss.item(),
-            "rmse": rmse,
-            "rmse_te": rmse_ch[0].item(),
-            "rmse_ti": rmse_ch[1].item(),
-            "mae_te": mae_ch[0].item(),
-            "mae_ti": mae_ch[1].item(),
-            "v_err": v_err,
-        }
+    @torch.no_grad()
+    def plot_overfit_result(model, dataset, device, steps=50):
+        model.eval()
 
-        hist["train"].append(log_entry)
+        views = dataset[0]  # list of 3 views
 
-        # ── print ──
-        print(
-            f"Epoch {epoch:03d} | "
-            f"Loss: {loss.item():.6f} | "
-            f"RMSE: {rmse:.6f} | "
-            f"MAE Te: {mae_ch[0].item():.6f} | "
-            f"MAE Ti: {mae_ch[1].item():.6f} | "
-            f"v_err: {v_err:.6f}"
-        )
+        fig, axes = plt.subplots(3, 6, figsize=(18, 9))
 
-        # ── save metrics ──
-        save_json(run_dir / "metrics.json", hist)
+        for v, (x, y_true, m) in enumerate(views):
+            x = x.unsqueeze(0).to(device)
+            y_true = y_true.unsqueeze(0).to(device)
+            m = m.unsqueeze(0).to(device)
 
-        # ── checkpointing (optional but recommended) ──
-        ckpt = {
-            "arch": "fm_unet_te_ti",
-            "model_state": model.state_dict(),
-            "opt_state": opt.state_dict(),
-            "epoch": epoch,
-        }
-        torch.save(ckpt, run_dir / "checkpoint_last.pt")
+            # ── Sampling (Flow Matching Euler) ──
+            B, _, H, W = x.shape
+            y = torch.randn(B, model.c_out, H, W, device=device) * m
 
-        if rmse < best_rmse:
-            best_rmse = rmse
-            torch.save(ckpt, run_dir / "checkpoint_best.pt")
+            dt = 1.0 / steps
+            for s in range(steps):
+                t = torch.full((B,), s / steps, device=device)
+                y = (y + model(x, y, t) * dt) * m
 
-    x, y, m = x0, y0, m0
+            y_pred = y[0].cpu().numpy()
+            y_true = y_true[0].cpu().numpy()
 
-    plot_prediction(
-        model,
-        x.unsqueeze(0),
-        y.unsqueeze(0),
-        m.unsqueeze(0),
-        device,
-        title="Single-sample overfit result"
-    )
+            # ── Plot Te (channel 0) ──
+            axes[v, 0].imshow(y_true[0], origin="lower")
+            axes[v, 0].set_title(f"View {v} Te GT")
 
-    plot_prediction_physical(
-        model,
-        x.unsqueeze(0),
-        y.unsqueeze(0),
-        m.unsqueeze(0),
-        device,
-        meta_path=run_dir /"norm.npz",
-        title="Physical Te/Ti (eV)"
-    )
+            axes[v, 1].imshow(y_pred[0], origin="lower")
+            axes[v, 1].set_title(f"View {v} Te Pred")
+
+            axes[v, 2].imshow(abs(y_true[0] - y_pred[0]), origin="lower")
+            axes[v, 2].set_title(f"View {v} Te Error")
+
+            # ── Plot Ti (channel 1) ──
+            axes[v, 3].imshow(y_true[1], origin="lower")
+            axes[v, 3].set_title(f"View {v} Ti GT")
+
+            axes[v, 4].imshow(y_pred[1], origin="lower")
+            axes[v, 4].set_title(f"View {v} Ti Pred")
+
+            axes[v, 5].imshow(abs(y_true[1] - y_pred[1]), origin="lower")
+            axes[v, 5].set_title(f"View {v} Ti Error")
+
+            for j in range(6):
+                axes[v, j].axis("off")
+
+        plt.tight_layout()
+        plt.show()
+    plot_overfit_result(model, train_ds, device)
+
 if __name__ == "__main__":
     main()

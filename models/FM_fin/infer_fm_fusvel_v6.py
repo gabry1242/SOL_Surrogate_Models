@@ -365,10 +365,15 @@ def masked_mae_per_channel_np(pred, y_true, mask, eps=1e-8):
     return (num / den).astype(np.float64)
 
 def masked_rmse_per_channel_np(pred, y_true, mask, eps=1e-8):
-    m   = np.broadcast_to(mask.astype(np.float64), pred.shape)
-    den = np.maximum(m.sum(axis=(0, 2, 3)), eps)
-    num = (((pred.astype(np.float64) - y_true.astype(np.float64)) ** 2) * m).sum(axis=(0, 2, 3))
-    return np.sqrt(num / den).astype(np.float64)
+    C   = pred.shape[1]
+    m1d = mask[:, 0].astype(np.float64)
+    den = np.maximum(float(m1d.sum()), eps)
+    out = np.empty(C, dtype=np.float64)
+    for j in range(C):
+        sq = (pred[:, j].astype(np.float64)
+              - y_true[:, j].astype(np.float64)) ** 2
+        out[j] = np.sqrt(float((sq * m1d).sum()) / den)
+    return out
 
 def masked_log_mae_per_channel_np(pred, y_true, mask, y_indices, pos_channels, signed_channels, eps_log=1e-3, eps_den=1e-8):
     pos_set    = set(int(c) for c in pos_channels)
@@ -395,14 +400,19 @@ def masked_log_mae_per_channel_np(pred, y_true, mask, y_indices, pos_channels, s
     return result
 
 def masked_relative_error_per_channel_np(pred, y_true, mask, rel_floor=1e-8, eps_den=1e-8):
-    m   = np.broadcast_to(mask.astype(np.float64), pred.shape)
-    den = np.maximum(m.sum(axis=(0, 2, 3)), eps_den)
-    p64 = pred.astype(np.float64)
-    t64 = y_true.astype(np.float64)
-    ae  = np.abs(p64 - t64)
-    ref = np.maximum(np.abs(t64), rel_floor)
-    num = ((ae / ref) * m).sum(axis=(0, 2, 3))
-    return (num / den).astype(np.float64)
+    """Memory-efficient version: iterate over channels to avoid allocating
+    (N, C, H, W) float64 arrays.  Peak memory = 2 × (N, H, W) float64."""
+    C   = pred.shape[1]
+    m1d = mask[:, 0].astype(np.float64)          # (N, H, W)
+    den = np.maximum(float(m1d.sum()), eps_den)   # scalar (same mask for all ch)
+    out = np.empty(C, dtype=np.float64)
+    for j in range(C):
+        p = pred[:, j].astype(np.float64)         # (N, H, W)
+        t = y_true[:, j].astype(np.float64)
+        ae  = np.abs(p - t)
+        ref = np.maximum(np.abs(t), rel_floor)
+        out[j] = float((ae / ref * m1d).sum()) / den
+    return out
 
 def _safe_float(v) -> float:
     f = float(v)
@@ -520,11 +530,13 @@ def main() -> None:
         X_peek = np.load(test_x_path, mmap_mode="r")
         _, _, H, W = X_peek.shape
 
-        all_preds_phys = []
+# Welford online mean/variance — never allocates more than 3 arrays
+        running_mean = np.zeros((N, c_out, H, W), dtype=np.float64)
+        running_M2   = np.zeros((N, c_out, H, W), dtype=np.float64)
+        masks        = np.zeros((N, 1,    H, W), dtype=np.float32)
 
         for sample_idx in range(n_samples):
             preds_norm = np.zeros((N, c_out, H, W), dtype=np.float32)
-            masks      = np.zeros((N, 1,    H, W), dtype=np.float32)
             idx0 = 0
 
             with torch.no_grad():
@@ -543,7 +555,8 @@ def main() -> None:
                         pred = euler_integrate_velocity(model, x, m, view_ids, c_out=c_out, n_steps=args.ode_steps, device=device)
 
                     preds_norm[idx0:idx0 + b] = pred.cpu().numpy()
-                    masks[idx0:idx0 + b]      = m.cpu().numpy()
+                    if sample_idx == 0:
+                        masks[idx0:idx0 + b] = m.cpu().numpy()
                     idx0 += b
 
             ym = y_mean.reshape(1, -1, 1, 1)
@@ -555,17 +568,21 @@ def main() -> None:
                 pos_channels=pos_channels, signed_channels=signed_channels,
                 eps=eps, s_c=s_c,
             )
-            preds_phys *= masks
-            all_preds_phys.append(preds_phys)
+            preds_phys = (preds_phys * masks).astype(np.float64)
 
+            # Welford update
+            n_seen   = sample_idx + 1
+            delta    = preds_phys - running_mean
+            running_mean += delta / n_seen
+            delta2   = preds_phys - running_mean
+            running_M2   += delta * delta2
+
+        preds_phys_mean = running_mean.astype(np.float32)
         if n_samples > 1:
-            stacked = np.stack(all_preds_phys, axis=0)
-            preds_phys_mean = stacked.mean(axis=0)
-            preds_phys_std  = stacked.std(axis=0)
+            preds_phys_std = np.sqrt(running_M2 / n_samples).astype(np.float32)
             np.save(out_dir / f"pred_Y_std_{args.test_split}_{view_tag}.npy", preds_phys_std)
-            preds_phys = preds_phys_mean
-        else:
-            preds_phys = all_preds_phys[0]
+
+        preds_phys = preds_phys_mean
 
         pred_path = out_dir / f"pred_Y_img_{args.test_split}_{view_tag}.npy"
         np.save(pred_path, preds_phys)

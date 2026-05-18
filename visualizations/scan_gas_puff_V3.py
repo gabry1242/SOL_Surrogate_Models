@@ -236,90 +236,32 @@ def infer_view_samples(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def scan_to_te_mesh(
-    params_arr, model, view_masks, view_geoms, c_in, c_out,
+    params_arr: np.ndarray,      # (N_scan, 8)
+    model, view_masks, view_geoms, c_in, c_out,
     x_mean, x_std, y_mean, y_std, s_c, eps,
     y_indices, pos_channels, signed_channels,
     j_Te, inv_maps, layout,
     mode, integrator, n_samples, n_steps, batch_size, device,
-    j_extra: int = -1,
-):
-    """Run scan pipeline; optionally track a second channel (j_extra) for density."""
-    N_scan      = params_arr.shape[0]
-    track_extra = (j_extra >= 0 and j_extra != j_Te)
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run the full scan pipeline for params_arr.
 
-    print("  Pre-building X tensors for all views ...")
-    view_X, view_M = {}, {}
-    for v in range(3):
-        view_X[v], view_M[v] = build_x_img_batch(
-            params_arr, view_masks[v], view_geoms[v], c_in, x_mean, x_std)
+    Memory strategy
+    ---------------
+    Each sample is processed one at a time:
+      1. Run 3 views sequentially → (N_scan, C_out, H, W) each, freed after use
+      2. Reconstruct to (N_scan, C_out, 104, 50), extract Te → (N_scan, 104, 50)
+      3. Update Welford running mean/variance, discard spatial array
+      4. Save scalar values at sepa/sepm for KDE plots
 
-    # Channel slice to keep before reconstruct_to_mesh
-    if track_extra:
-        keep_lo  = min(j_Te, j_extra)
-        keep_hi  = max(j_Te, j_extra) + 1
-        j_Te_sl  = j_Te   - keep_lo
-        j_ex_sl  = j_extra - keep_lo
-    else:
-        keep_lo, keep_hi = j_Te, j_Te + 1
-        j_Te_sl  = 0
-        j_ex_sl  = -1
+    Peak RAM ≈ 3 × (N_scan × C_out × H × W) × float32  (one view buffer each)
 
-    wf_mean = np.zeros((N_scan, 104, 50), dtype=np.float64)
-    wf_M2   = np.zeros((N_scan, 104, 50), dtype=np.float64)
-    if track_extra:
-        wf_mean_ex = np.zeros((N_scan, 104, 50), dtype=np.float64)
-        wf_M2_ex   = np.zeros((N_scan, 104, 50), dtype=np.float64)
-
-    te_ot_samp  = np.zeros((n_samples, N_scan), dtype=np.float32)
-    te_omp_samp = np.zeros((n_samples, N_scan), dtype=np.float32)
-    ex_ot_samp  = np.zeros((n_samples, N_scan), dtype=np.float32) if track_extra else None
-    ex_omp_samp = np.zeros((n_samples, N_scan), dtype=np.float32) if track_extra else None
-
-    for s in range(n_samples):
-        print(f"  Sample {s+1}/{n_samples} ...", end="\r", flush=True)
-        pred_views = {}
-        for v in range(3):
-            pred_full = infer_view_samples(
-                model, view_X[v], view_M[v], view_id=v, c_out=c_out,
-                n_steps=n_steps, mode=mode, integrator=integrator,
-                y_indices=y_indices, pos_channels=pos_channels,
-                signed_channels=signed_channels,
-                y_mean=y_mean, y_std=y_std, eps=eps, s_c=s_c,
-                batch_size=batch_size, device=device,
-            )
-            pred_views[f"view{v}"] = pred_full[:, keep_lo:keep_hi, :, :]
-            del pred_full
-
-        mesh_out, _ = reconstruct_to_mesh(pred_views, inv_maps, layout)
-        del pred_views
-
-        te_s  = mesh_out[:, j_Te_sl, :, :].astype(np.float64)
-        delta  = te_s - wf_mean
-        wf_mean += delta / (s + 1)
-        wf_M2   += delta * (te_s - wf_mean)
-
-        te_ot_samp[s]  = te_s[:, inv_maps["_ix_ot"],  inv_maps["_iy_sep"]]
-        te_omp_samp[s] = te_s[:, inv_maps["_ix_omp"], inv_maps["_iy_sep"]]
-
-        if track_extra:
-            ex_s = mesh_out[:, j_ex_sl, :, :].astype(np.float64)
-            dx   = ex_s - wf_mean_ex
-            wf_mean_ex += dx / (s + 1)
-            wf_M2_ex   += dx * (ex_s - wf_mean_ex)
-            ex_ot_samp[s]  = ex_s[:, inv_maps["_ix_ot"],  inv_maps["_iy_sep"]]
-            ex_omp_samp[s] = ex_s[:, inv_maps["_ix_omp"], inv_maps["_iy_sep"]]
-        del mesh_out
-
-    print()
-    te_mean = wf_mean.astype(np.float32)
-    te_std  = np.sqrt(wf_M2 / max(n_samples - 1, 1)).astype(np.float32)
-    if track_extra:
-        ex_mean = wf_mean_ex.astype(np.float32)
-        ex_std  = np.sqrt(wf_M2_ex / max(n_samples - 1, 1)).astype(np.float32)
-    else:
-        ex_mean = ex_std = None
-
-    return te_mean, te_std, te_ot_samp, te_omp_samp, ex_mean, ex_std, ex_ot_samp, ex_omp_samp
+    Returns
+    -------
+    te_mean         : (N_scan, 104, 50) float32
+    te_std          : (N_scan, 104, 50) float32
+    te_ot_samples   : (n_samples, N_scan) float32 — scalars at sepa
+    te_omp_samples  : (n_samples, N_scan) float32 — scalars at sepm
+    """
     N_scan   = params_arr.shape[0]
     ix_ot    = inv_maps.get("ix_ot",  None)   # resolved by caller via geometry
     # Pre-build per-view X tensors once (reused across all samples)
@@ -508,25 +450,6 @@ def run_scan(args):
     j_Te = y_indices.index(0)
     print(f"  Te is at prediction position j_Te={j_Te}")
 
-    # Density channel for anti-correlation analysis.
-    # y_indices flat ordering: Te=0, Ti=1, na_0=2, na_1=3, ..., na_9=11, ua_0=12, ...
-    # --na_species k selects the k-th density species (0=D0, 1=D1, 2=N0, ...).
-    # The corresponding y_index is (2 + k), because Te and Ti occupy indices 0 and 1.
-    # The previous code looked for na_species_idx directly in y_indices, which
-    # found Te (y_index 0) instead of the density channel — hence track_extra=False.
-    na_species_idx = args.na_species
-    na_y_idx       = 2 + na_species_idx          # offset past Te (0) and Ti (1)
-    j_extra        = na_y_idx if na_y_idx in y_indices else -1
-    _na_name = {0:'D0 neutral', 1:'D1 ion', 2:'N0', 3:'N1', 4:'N2',
-                5:'N3', 6:'N4', 7:'N5', 8:'N6', 9:'N7'}.get(na_species_idx,
-                f'species {na_species_idx}')
-    if j_extra >= 0:
-        print(f"  Density: na species {na_species_idx} ({_na_name}) → y_index={na_y_idx}, "
-              f"j_extra={j_extra}  (offset: Te=0, Ti=1, na starts at 2)")
-    else:
-        print(f"  na species {na_species_idx} (y_index {na_y_idx}) not in model outputs "
-              f"— density plots disabled.  Model y_indices: {y_indices}")
-
     # ── 2.  Build model ──────────────────────────────────────────────────────
     model = VelocityUNet(
         c_in=c_in, c_out=c_out, base=base, t_dim=t_dim, n_views=3
@@ -650,7 +573,7 @@ def run_scan(args):
         s_c=s_c, eps=eps,
         y_indices=y_indices,
         pos_channels=pos_channels, signed_channels=signed_channels,
-        j_Te=j_Te, j_extra=j_extra, inv_maps=inv_maps, layout=layout,
+        j_Te=j_Te, inv_maps=inv_maps, layout=layout,
         mode=mode, integrator=args.integrator,
         n_samples=args.n_samples, n_steps=args.ode_steps,
         batch_size=args.batch_size, device=device,
@@ -664,8 +587,7 @@ def run_scan(args):
     print("  2D gas puff scan ...")
     print("="*60)
     params_2d, ND, NN = build_params_2d(dpuff_vals, npuff_vals, fixed)
-    te_mean_2d_full, te_std_2d_full, te_ot_samp_2d, te_omp_samp_2d, \
-        na_mean_2d_full, na_std_2d_full, na_ot_samp_2d, na_omp_samp_2d = \
+    te_mean_2d_full, te_std_2d_full, te_ot_samp_2d, te_omp_samp_2d = \
         scan_to_te_mesh(params_2d, **scan_kw)
 
     # Scalar Te,ot over the full 2D grid
@@ -693,29 +615,22 @@ def run_scan(args):
     # This eliminates the previous redundant re-run (was 2x the total compute).
     te_ot_samp_1d  = te_ot_samp_2d.reshape(args.n_samples, ND, NN)[:, :, i_n]
     te_omp_samp_1d = te_omp_samp_2d.reshape(args.n_samples, ND, NN)[:, :, i_n]
-    print(f"  KDE samples extracted from 2D scan  (shape: {te_ot_samp_1d.shape})")
-
-    # Density 1D slice
-    if na_ot_samp_2d is not None:
-        na_ot_mean_1d  = na_mean_2d_full.reshape(ND, NN, 104, 50)[:, i_n, ix_ot,  iy_sep]
-        na_omp_mean_1d = na_mean_2d_full.reshape(ND, NN, 104, 50)[:, i_n, ix_omp, iy_sep]
-        na_ot_samp_1d  = na_ot_samp_2d.reshape(args.n_samples, ND, NN)[:, :, i_n]
-        na_omp_samp_1d = na_omp_samp_2d.reshape(args.n_samples, ND, NN)[:, :, i_n]
-    else:
-        na_ot_mean_1d = na_omp_mean_1d = na_ot_samp_1d = na_omp_samp_1d = None
+    print(f"  KDE samples extracted from 2D scan  "
+          f"(shape: {te_ot_samp_1d.shape})  — no re-run needed")
 
     del te_mean_2d_full, te_std_2d_full, te_ot_samp_2d, te_omp_samp_2d
-    if na_mean_2d_full is not None:
-        del na_mean_2d_full, na_std_2d_full, na_ot_samp_2d, na_omp_samp_2d
 
-    # ── 9.  OOD extended scan ─────────────────────────────────────────────────
+    # ── 9.  OOD extended scan — only the NEW points beyond dpuff_max ─────────
+    # dpuff_ood = concat(dpuff_vals, dpuff_ood_ext) — see grid construction above.
+    # dpuff_vals part is already computed in the 1D extraction; only run extension.
     print("\n" + "="*60)
     print(f"  OOD extension ({len(dpuff_ood_ext)} new points beyond {args.dpuff_max:.0e}) ...")
     print("="*60)
     params_ood_ext = build_params_1d(dpuff_ood_ext, args.npuff_fixed, fixed)
-    te_mean_ext, te_std_ext, te_ot_samp_ext, te_omp_samp_ext, _, _, _, _ = \
-        scan_to_te_mesh(params_ood_ext, **scan_kw)
+    te_mean_ext, te_std_ext, te_ot_samp_ext, te_omp_samp_ext = scan_to_te_mesh(
+        params_ood_ext, **scan_kw)
 
+    # Concatenate in-distribution (from 1D) + extension
     te_ot_mean_ood  = np.concatenate([te_ot_mean_1d,  te_mean_ext[:, ix_ot,  iy_sep]])
     te_omp_mean_ood = np.concatenate([te_omp_mean_1d, te_mean_ext[:, ix_omp, iy_sep]])
     te_ot_std_ood   = np.concatenate([te_ot_std_1d,   te_std_ext[:,  ix_ot,  iy_sep]])
@@ -801,10 +716,10 @@ def run_scan(args):
     ax.set_ylim(bottom=5e-1)
 
     ax = axes[1]
-    ax.plot(dpuff_vals, te_ot_std_1d_plot, color='C0', lw=1.8,
+    ax.plot(dpuff_vals, te_ot_std_1d_plot, color='C0', lw=2.0,
             label='std(Te,ot)  [eV]')
     if _omp_std_path.exists():
-        ax.plot(dpuff_vals, te_omp_std_1d_plot, color='C1', lw=1.8,
+        ax.plot(dpuff_vals, te_omp_std_1d_plot, color='C1', lw=2.0,
                 label='std(Te,omp)  [eV]')
     ax.axvline(dpuff_vals[_trans], color='gray', lw=1.0, ls=':', alpha=0.7)
     ax.set_yscale('log')
@@ -824,10 +739,10 @@ def run_scan(args):
     )
 
     ax = axes[2]
-    ax.plot(dpuff_vals, cv_ot_1d * 100, color='C0', lw=1.8,
+    ax.plot(dpuff_vals, cv_ot_1d  * 100, color='C0', lw=2.0,
             label='CV  Te,ot  [%]')
     if _omp_std_path.exists():
-        ax.plot(dpuff_vals, cv_omp_1d * 100, color='C1', lw=1.8,
+        ax.plot(dpuff_vals, cv_omp_1d * 100, color='C1', lw=2.0,
                 label='CV  Te,omp  [%]')
     ax.axvline(dpuff_vals[_trans], color='gray', lw=1.0, ls=':', alpha=0.7)
     ax.set_xscale('log')
@@ -1196,166 +1111,7 @@ def run_scan(args):
     plt.close(fig)
     print("    Saved: fig_ood_extension.png")
 
-    # ─ Scatter: all n_samples dots at every D_puff ───────────────────────────
-    fig, ax = plt.subplots(figsize=(13, 5.5))
-    ax.set_yscale('log')
-    cmap_sc = plt.cm.coolwarm(np.linspace(0, 1, len(dpuff_vals)))
-    rng = np.random.default_rng(0)
-    for i, (dp, col) in enumerate(zip(dpuff_vals, cmap_sc)):
-        ys = te_ot_samp_1d[:, i]; ys = ys[ys > 0]
-        if len(ys) == 0: continue
-        jitter = dp * 0.003 * (rng.random(len(ys)) - 0.5)
-        ax.scatter(np.full(len(ys), dp) + jitter, ys,
-                   s=2, alpha=0.25, color=col, linewidths=0, rasterized=True)
-    ax.plot(dpuff_vals, te_ot_mean_1d, color='black', lw=2, zorder=5, label='FM mean')
-    q05 = np.percentile(te_ot_samp_1d, 5,  axis=0)
-    q95 = np.percentile(te_ot_samp_1d, 95, axis=0)
-    ax.plot(dpuff_vals, np.maximum(q05, 1e-2), color='black', lw=1, ls='--',
-            alpha=0.5, label='5th–95th pct')
-    ax.plot(dpuff_vals, q95, color='black', lw=1, ls='--', alpha=0.5)
-    ax.axvline(dpuff_vals[trans_idx], color='gray', lw=1, ls=':',
-               label=f'transition ≈ {dpuff_vals[trans_idx]:.1e}')
-    ax.set_xlabel('D$_{puff}$  [atoms/s]', fontsize=11)
-    ax.set_ylabel('Te,ot  [eV]', fontsize=11)
-    ax.set_xlim(dpuff_vals[0], dpuff_vals[-1])
-    ax.set_title(
-        f'All {args.n_samples} FM samples at each D_puff  (N_puff={args.npuff_fixed:.0e})\n'
-        f'One cluster → two clusters → one cluster across the transition.',
-        fontsize=9)
-    ax.legend(fontsize=8); ax.grid(True, which='both', alpha=0.2)
-    fig.tight_layout()
-    fig.savefig(out_dir / "fig_scatter_all_samples.png", dpi=150)
-    plt.close(fig)
-    print("    Saved: fig_scatter_all_samples.png")
-
-    # ─ Peak amplitude convergence ─────────────────────────────────────────────
-    # FIX: sort peaks by Te POSITION (value), not by KDE height.
-    # Previous bug: sorting by height caused label swap at n≈500.
-    def peak_info_fixed(samp, n_eval):
-        """Return (low_Te_peak, high_Te_peak) sorted by position, not height."""
-        from scipy.signal import argrelmax
-        sub = samp[:n_eval]; sub = sub[sub > 0]
-        if len(sub) < 5: return np.nan, np.nan
-        x_g, dens = kde_log(sub, n_pts=200)
-        peaks_idx, = argrelmax(dens, order=4)
-        if len(peaks_idx) == 0:
-            return float(x_g[np.argmax(dens)]), np.nan
-        peak_te = sorted(float(x_g[p]) for p in peaks_idx)  # sort by Te value
-        p1 = peak_te[0]                                       # always low-Te peak
-        p2 = peak_te[-1] if len(peak_te) >= 2 else np.nan    # always high-Te peak
-        return p1, p2
-
-    samp_tr  = te_ot_samp_1d[:, trans_idx]; samp_tr  = samp_tr[samp_tr > 0]
-    samp_pre = te_ot_samp_1d[:, pre_idx];   samp_pre = samp_pre[samp_pre > 0]
-    ns_range = np.unique(np.round(
-        np.logspace(np.log10(10), np.log10(len(samp_tr)), 40)).astype(int))
-    ns_range = ns_range[ns_range <= len(samp_tr)]
-
-    p1_tr, p2_tr, std_conv = [], [], []
-    for n in ns_range:
-        p1, p2 = peak_info_fixed(samp_tr, n)
-        p1_tr.append(p1); p2_tr.append(p2)
-        sub = samp_tr[:n]; sub = sub[sub > 0]
-        std_conv.append(float(sub.std()) if len(sub) > 1 else np.nan)
-
-    p1_pre, p2_pre = [], []
-    for n in ns_range:
-        p1, p2 = peak_info_fixed(samp_pre, n)
-        p1_pre.append(p1); p2_pre.append(p2)
-
-    fig, axes_p = plt.subplots(1, 3, figsize=(15, 4.5))
-    for ax, p1, p2, title in [
-        (axes_p[0], p1_tr,  p2_tr,
-         f'Transition  D≈{dpuff_vals[trans_idx]:.1e}'),
-        (axes_p[1], p1_pre, p2_pre,
-         f'Pre-transition  D≈{dpuff_vals[pre_idx]:.1e}'),
-    ]:
-        ax.semilogx(ns_range, p1, color='steelblue', lw=1.8,
-                    label='Peak 1 (low Te, detached)')
-        ax.semilogx(ns_range, p2, color='tomato',    lw=1.8, ls='--',
-                    label='Peak 2 (high Te, sheath-limited)')
-        ax.set_xlabel('n_samples'); ax.set_ylabel('Te,ot  [eV]')
-        ax.set_title(title + '\n(peaks sorted by Te value, not height)', fontsize=9)
-        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-
-    axes_p[2].semilogx(ns_range, std_conv, color='black', lw=1.8)
-    axes_p[2].set_xlabel('n_samples'); axes_p[2].set_ylabel('std(Te,ot)  [eV]')
-    axes_p[2].set_title(f'std convergence at transition\nD≈{dpuff_vals[trans_idx]:.1e}',
-                        fontsize=9)
-    axes_p[2].grid(True, alpha=0.3)
-    fig.suptitle(
-        f'Sampling convergence — peak positions and std vs n_samples\n'
-        f'N_puff={args.npuff_fixed:.0e}  |  total n_samples={args.n_samples}',
-        fontsize=10)
-    fig.tight_layout()
-    fig.savefig(out_dir / "fig_peak_convergence.png", dpi=150)
-    plt.close(fig)
-    print("    Saved: fig_peak_convergence.png")
-
-    # ─ Density anti-correlation ───────────────────────────────────────────────
-    if na_ot_samp_1d is not None:
-        fig, axes_d = plt.subplots(1, 3, figsize=(16, 5))
-
-        # Panel 1: mean Te and mean na vs D_puff (outer target)
-        ax = axes_d[0]
-        ax.semilogy(dpuff_vals, te_ot_mean_1d, color='steelblue', lw=2,
-                    label='Te,ot  [eV]')
-        ax2 = ax.twinx()
-        ax2.semilogy(dpuff_vals, np.maximum(na_ot_mean_1d, 1e-10),
-                     color='tomato', lw=2, label=f'na,ot  ({_na_name})  [m⁻³]')
-        ax.set_xlabel('D$_{puff}$  [atoms/s]', fontsize=10)
-        ax.set_ylabel('Te,ot  [eV]', color='steelblue', fontsize=10)
-        ax2.set_ylabel('na,ot  [m⁻³]',  color='tomato',    fontsize=10)
-        ax.axvline(dpuff_vals[trans_idx], color='gray', lw=1, ls=':')
-        lines1, lab1 = ax.get_legend_handles_labels()
-        lines2, lab2 = ax2.get_legend_handles_labels()
-        ax.legend(lines1+lines2, lab1+lab2, fontsize=8)
-        ax.set_title(f'Te vs {_na_name} density — outer target\n'
-                     f'Anti-proportional → na should rise as Te falls', fontsize=9)
-
-        # Panel 2: OMP density (upstream) — should always increase with D_puff
-        ax = axes_d[1]
-        ax.semilogy(dpuff_vals, te_omp_mean_1d, color='steelblue', lw=2,
-                    label='Te,omp  [eV]')
-        ax3 = ax.twinx()
-        ax3.semilogy(dpuff_vals, np.maximum(na_omp_mean_1d, 1e-10),
-                     color='darkorange', lw=2, label=f'na,omp  ({_na_name})  [m⁻³]')
-        ax.set_xlabel('D$_{puff}$  [atoms/s]', fontsize=10)
-        ax.set_ylabel('Te,omp  [eV]', color='steelblue', fontsize=10)
-        ax3.set_ylabel('na,omp  [m⁻³]',  color='darkorange', fontsize=10)
-        ax.axvline(dpuff_vals[trans_idx], color='gray', lw=1, ls=':')
-        lines1, lab1 = ax.get_legend_handles_labels()
-        lines2, lab2 = ax3.get_legend_handles_labels()
-        ax.legend(lines1+lines2, lab1+lab2, fontsize=8)
-        ax.set_title(f'Te vs {_na_name} density — outer midplane (upstream)\n'
-                     f'Upstream density should rise monotonically with D_puff', fontsize=9)
-
-        # Panel 3: (Te, na) scatter at transition — bimodal in both?
-        ax = axes_d[2]
-        te_sc = te_ot_samp_1d[:, trans_idx]
-        na_sc = na_ot_samp_1d[:, trans_idx]
-        valid = (te_sc > 0) & (na_sc > 0)
-        sc = ax.scatter(te_sc[valid], na_sc[valid],
-                        s=8, alpha=0.4, c=np.arange(valid.sum()), cmap='plasma')
-        ax.set_xscale('log'); ax.set_yscale('log')
-        ax.set_xlabel('Te,ot  [eV]', fontsize=10)
-        ax.set_ylabel(f'na,ot  [m⁻³]  ({_na_name})', fontsize=10)
-        ax.set_title(f'(Te, na) at transition D≈{dpuff_vals[trans_idx]:.1e}\n'
-                     f'{valid.sum()} samples — expect 2 clusters (anti-correlated)', fontsize=9)
-        ax.grid(True, which='both', alpha=0.25)
-        plt.colorbar(sc, ax=ax, label='sample index')
-
-        fig.suptitle(
-            f'Temperature–density anti-correlation  '
-            f'(N_puff={args.npuff_fixed:.0e},  n_samples={args.n_samples},  '
-            f'species: {_na_name})',
-            fontsize=10)
-        fig.tight_layout()
-        fig.savefig(out_dir / "fig_te_na_anticorrelation.png", dpi=150)
-        plt.close(fig)
-        print("    Saved: fig_te_na_anticorrelation.png")
-    else:
-        print("    Skipping fig_te_na_anticorrelation.png: species not in model outputs")
+    # ── Done ─────────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"  All outputs written to: {out_dir}")
     print(f"  Figures:")
@@ -1432,12 +1188,9 @@ def main():
 
     # ── KDE / visualisation settings ──────────────────────────────────────────
     ap.add_argument("--kde_n_transition", type=int, default=6,
-                    help="Number of KDE curves to show WITHIN the transition window.")
-    ap.add_argument("--na_species", type=int, default=0,
-                    help="Species index for density anti-correlation plot.  "
-                         "0=D0 neutral (default, increases at target in detachment), "
-                         "1=D1 ion (decreases), 2-9=nitrogen species.  "
-                         "The supervisor's '1-based index 1' = 0-based index 0 = D0.")
+                    help="Number of KDE curves to show WITHIN the transition window "
+                         "(±kde_n_transition/2 points around the steepest drop).  "
+                         "Higher → more detail in the bimodal region.  Default: 6.")
 
     # ── Optional ground truth overlay ─────────────────────────────────────────
     ap.add_argument("--test_X_path",  default=None,

@@ -858,16 +858,27 @@ def inverse_transform_y(y_t, y_indices, pos_channels, signed_channels, eps, s_c)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def masked_mae_per_channel_np(pred, y_true, mask, eps=1e-8):
-    m   = np.broadcast_to(mask.astype(np.float64), pred.shape)
-    den = np.maximum(m.sum(axis=(0, 2, 3)), eps)
-    num = (np.abs(pred.astype(np.float64) - y_true.astype(np.float64)) * m).sum(axis=(0, 2, 3))
-    return (num / den).astype(np.float64)
+    # Channel-loop: never allocates the full (N,C,H,W) float64 array at once
+    C = pred.shape[1]
+    result = np.zeros(C, dtype=np.float64)
+    m1 = mask[:, 0].astype(np.float64)          # (N, H, W)
+    den_scalar = max(float(m1.sum()), eps)
+    for c in range(C):
+        p = pred[:, c].astype(np.float64)
+        t = y_true[:, c].astype(np.float64)
+        result[c] = float((np.abs(p - t) * m1).sum() / den_scalar)
+    return result
 
 def masked_rmse_per_channel_np(pred, y_true, mask, eps=1e-8):
-    m   = np.broadcast_to(mask.astype(np.float64), pred.shape)
-    den = np.maximum(m.sum(axis=(0, 2, 3)), eps)
-    num = (((pred.astype(np.float64) - y_true.astype(np.float64)) ** 2) * m).sum(axis=(0, 2, 3))
-    return np.sqrt(num / den).astype(np.float64)
+    C = pred.shape[1]
+    result = np.zeros(C, dtype=np.float64)
+    m1 = mask[:, 0].astype(np.float64)
+    den_scalar = max(float(m1.sum()), eps)
+    for c in range(C):
+        p = pred[:, c].astype(np.float64)
+        t = y_true[:, c].astype(np.float64)
+        result[c] = float(np.sqrt(((p - t) ** 2 * m1).sum() / den_scalar))
+    return result
 
 def masked_log_mae_per_channel_np(pred, y_true, mask, y_indices,
                                    pos_channels, signed_channels,
@@ -876,33 +887,36 @@ def masked_log_mae_per_channel_np(pred, y_true, mask, y_indices,
     signed_set = set(int(c) for c in signed_channels)
     C_sel      = len(y_indices)
     result     = np.zeros(C_sel, dtype=np.float64)
-    m          = np.broadcast_to(mask.astype(np.float64), pred.shape)
+    m1 = mask[:, 0].astype(np.float64)
+    den_scalar = max(float(m1.sum()), eps_den)
     for j, orig_c in enumerate(y_indices):
-        den = max(float(m[:, j:j+1].sum()), eps_den)
         p64 = pred[:, j].astype(np.float64)
         t64 = y_true[:, j].astype(np.float64)
         if int(orig_c) in pos_set:
             log_p = np.log10(np.maximum(p64, 0.0) + eps_log)
             log_t = np.log10(np.maximum(t64, 0.0) + eps_log)
-            ae    = np.abs(log_p - log_t) * m[:, j]
+            ae    = np.abs(log_p - log_t) * m1
         elif int(orig_c) in signed_set:
             symlog_p = np.sign(p64) * np.log10(np.abs(p64) + 1.0)
             symlog_t = np.sign(t64) * np.log10(np.abs(t64) + 1.0)
-            ae = np.abs(symlog_p - symlog_t) * m[:, j]
+            ae = np.abs(symlog_p - symlog_t) * m1
         else:
             ae = np.zeros_like(p64)
-        result[j] = float(ae.sum() / den)
+        result[j] = float(ae.sum() / den_scalar)
     return result
 
 def masked_relative_error_per_channel_np(pred, y_true, mask, rel_floor=1e-8, eps_den=1e-8):
-    m   = np.broadcast_to(mask.astype(np.float64), pred.shape)
-    den = np.maximum(m.sum(axis=(0, 2, 3)), eps_den)
-    p64 = pred.astype(np.float64)
-    t64 = y_true.astype(np.float64)
-    ae  = np.abs(p64 - t64)
-    ref = np.maximum(np.abs(t64), rel_floor)
-    num = ((ae / ref) * m).sum(axis=(0, 2, 3))
-    return (num / den).astype(np.float64)
+    C = pred.shape[1]
+    result = np.zeros(C, dtype=np.float64)
+    m1 = mask[:, 0].astype(np.float64)
+    den_scalar = max(float(m1.sum()), eps_den)
+    for c in range(C):
+        p = pred[:, c].astype(np.float64)
+        t = y_true[:, c].astype(np.float64)
+        ae  = np.abs(p - t)
+        ref = np.maximum(np.abs(t), rel_floor)
+        result[c] = float(((ae / ref) * m1).sum() / den_scalar)
+    return result
 
 def _safe_float(v) -> float:
     f = float(v)
@@ -1092,10 +1106,16 @@ def _run_v9_inference(
     """
     Run inference with forward_3views() at every step.
 
-    One DataLoader yields (x0,m0, x1,m1, x2,m2) per batch — all 3 views of
-    the same simulation together.  Per-view Welford accumulators collect
-    mean and variance across n_samples draws.
+    Memory-safe version: Welford accumulators are stored as numpy memmaps
+    on disk rather than in RAM.  This keeps peak RAM at O(batch_size)
+    regardless of the dataset size.
+
+    The original version allocated (N, c_out, H, W) × 6 float64 arrays
+    plus a (N, c_out, H, W) × 3 float32 GPU tensor — easily 100+ GB for
+    N=2930, which causes the OS to freeze trying to swap.
     """
+    import tempfile, os
+
     # ── Load 3-view dataset ──────────────────────────────────────────────────
     ds3 = ThreeViewXDataset(prefix, split, x_mean, x_std)
     dl3 = DataLoader(ds3, batch_size=batch_size, shuffle=False,
@@ -1103,43 +1123,37 @@ def _run_v9_inference(
     N = len(ds3)
 
     # ── Spatial dimensions per view ──────────────────────────────────────────
-    # All views are padded to Hmax × Wmax so shapes should be identical, but
-    # we derive them independently for robustness.
     shapes: List[Tuple[int, int]] = []
     for v in range(3):
         arr = np.load(Path(f"{prefix}_view{v}_X_img_{split}.npy"), mmap_mode="r")
         shapes.append((arr.shape[2], arr.shape[3]))  # (H, W)
     print(f"  View shapes (H×W): {shapes}")
+    print(f"  N={N}  c_out={c_out}  n_samples={n_samples}")
 
-    # ── Extract masks for all 3 views in one DataLoader pass ─────────────────
-    # masks_v[v] shape: (N, 1, H, W)
-    masks_v = [np.zeros((N, 1, shapes[v][0], shapes[v][1]), dtype=np.float32)
-               for v in range(3)]
-    _idx = 0
-    for batch in DataLoader(ds3, batch_size=batch_size, shuffle=False, num_workers=0):
-        x0, m0, x1, m1, x2, m2 = batch
-        b = x0.shape[0]
-        masks_v[0][_idx:_idx+b] = m0.numpy()
-        masks_v[1][_idx:_idx+b] = m1.numpy()
-        masks_v[2][_idx:_idx+b] = m2.numpy()
-        _idx += b
+    # ── Memory estimate and warning ───────────────────────────────────────────
+    wf_bytes = sum(2 * N * c_out * shapes[v][0] * shapes[v][1] * 4
+                   for v in range(3))  # float32
+    print(f"  Welford arrays: {wf_bytes / 1e9:.1f} GB  → using disk memmap")
 
-    # ── Welford accumulators — one pair per view ──────────────────────────────
-    wf_mean = [np.zeros((N, c_out, shapes[v][0], shapes[v][1]), dtype=np.float64)
-               for v in range(3)]
-    wf_M2   = [np.zeros((N, c_out, shapes[v][0], shapes[v][1]), dtype=np.float64)
-               for v in range(3)]
+    # ── Welford accumulators on disk (float32 to halve size vs float64) ───────
+    # Stored as temp .npy memmaps in out_dir so they survive a crash
+    wf_dir = out_dir / "_wf_tmp"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    wf_mean = []
+    wf_M2   = []
+    for v in range(3):
+        H, W = shapes[v]
+        mean_path = wf_dir / f"wf_mean_view{v}.npy"
+        m2_path   = wf_dir / f"wf_M2_view{v}.npy"
+        wf_mean.append(np.lib.format.open_memmap(
+            mean_path, mode="w+", dtype=np.float32, shape=(N, c_out, H, W)))
+        wf_M2.append(np.lib.format.open_memmap(
+            m2_path,   mode="w+", dtype=np.float32, shape=(N, c_out, H, W)))
+    print(f"  Welford memmaps written to {wf_dir}")
 
     # ── Sample loop ──────────────────────────────────────────────────────────
     for sample_idx in range(n_samples):
-        print(f"    sample {sample_idx+1}/{n_samples}", end="\r", flush=True)
-
-        # Accumulate per-view predictions on GPU before one bulk CPU transfer
-        preds_gpu = [
-            torch.zeros(N, c_out, shapes[v][0], shapes[v][1],
-                        dtype=torch.float32, device=device)
-            for v in range(3)
-        ]
+        print(f"    sample {sample_idx+1}/{n_samples} ...", flush=True)
         idx0 = 0
 
         with torch.no_grad():
@@ -1168,26 +1182,33 @@ def _run_v9_inference(
                         model, x0g, m0g, x1g, m1g, x2g, m2g,
                         c_out=c_out, n_steps=n_steps, device=device)
 
-                preds_gpu[0][idx0:idx0+b] = p0
-                preds_gpu[1][idx0:idx0+b] = p1
-                preds_gpu[2][idx0:idx0+b] = p2
+                # ── Welford update per batch, per view — never hold full-N ──
+                for v, (pv, mv) in enumerate([(p0, m0g), (p1, m1g), (p2, m2g)]):
+                    # Denorm + invert directly on the batch slice
+                    preds_norm_b = pv.cpu().numpy()          # (b, c_out, H, W)
+                    mask_b       = mv.cpu().numpy()          # (b, 1,    H, W)
+                    preds_phys_b = _denorm_and_invert(
+                        preds_norm_b, mask_b, y_mean, y_std,
+                        y_indices, pos_channels, signed_channels, eps, s_c,
+                    ).astype(np.float32)                     # (b, c_out, H, W)
+
+                    # Online Welford on the memmap slice
+                    prev_mean = wf_mean[v][idx0:idx0+b].copy()
+                    delta     = preds_phys_b - prev_mean
+                    wf_mean[v][idx0:idx0+b] += delta / (sample_idx + 1)
+                    delta2 = preds_phys_b - wf_mean[v][idx0:idx0+b]
+                    wf_M2[v][idx0:idx0+b]   += delta * delta2
+
+                    del preds_norm_b, mask_b, preds_phys_b, prev_mean, delta, delta2
+
                 idx0 += b
 
-        # ── Per-view: transfer GPU→CPU, denorm, Welford update ───────────────
+        # Flush memmaps to disk after each sample so progress is durable
         for v in range(3):
-            preds_norm = preds_gpu[v].cpu().numpy()
-            preds_phys = _denorm_and_invert(
-                preds_norm, masks_v[v], y_mean, y_std,
-                y_indices, pos_channels, signed_channels, eps, s_c,
-            )
-            delta          = preds_phys.astype(np.float64) - wf_mean[v]
-            wf_mean[v]    += delta / (sample_idx + 1)
-            wf_M2[v]      += delta * (preds_phys.astype(np.float64) - wf_mean[v])
-            del preds_norm, preds_phys
+            wf_mean[v].flush()
+            wf_M2[v].flush()
 
-        del preds_gpu
-
-    print()  # newline after \r
+    print()  # newline
 
     # ── Save outputs and compute metrics ─────────────────────────────────────
     all_view_metrics = {}
@@ -1195,31 +1216,45 @@ def _run_v9_inference(
     for v in range(3):
         view_tag = f"view{v}"
 
-        preds_mean = wf_mean[v].astype(np.float32)
-        preds_std  = np.sqrt(wf_M2[v] / max(n_samples - 1, 1)).astype(np.float32)
-
+        # Save predictions directly from memmap (no full-N copy into RAM)
         pred_path = out_dir / f"pred_Y_img_{split}_{view_tag}.npy"
-        np.save(pred_path, preds_mean)
-        print(f"  Saved: {pred_path}  shape={preds_mean.shape}")
+        np.save(pred_path, wf_mean[v])        # memmap → disk, numpy handles chunking
+        print(f"  Saved: {pred_path}  shape={wf_mean[v].shape}")
 
         if n_samples > 1:
+            std_arr  = np.sqrt(
+                np.maximum(wf_M2[v].astype(np.float32), 0.0)
+                / max(n_samples - 1, 1)
+            )
             std_path = out_dir / f"pred_Y_std_{split}_{view_tag}.npy"
-            np.save(std_path, preds_std)
-            print(f"  Saved: {std_path}  shape={preds_std.shape}")
+            np.save(std_path, std_arr)
+            del std_arr
+            print(f"  Saved: {std_path}")
 
-        # Metrics against ground truth
+        # Reload pred as memmap so metrics iterate channel-by-channel
+        preds_mean = np.load(pred_path, mmap_mode="r")
+
+        # Load mask from X tensor channel 0 — (N,1,H,W) float32
+        x_path = Path(f"{prefix}_view{v}_X_img_{split}.npy")
+        X_ref  = np.load(x_path, mmap_mode="r")
+        mask_v = np.array(X_ref[:, 0:1, :, :], dtype=np.float32)
+        del X_ref
+
+        # Load Y ground truth as memmap, select channels — still (N,C,H,W) float32
+        # but metrics functions now loop channel-by-channel, so peak RAM is O(N*H*W)
         y_path = Path(f"{prefix}_view{v}_Y_img_{split}.npy")
         Y_full = np.load(y_path, mmap_mode="r")
-        Y_sel  = np.array(Y_full[:, y_indices, :, :], dtype=np.float32)
+        Y_sel  = Y_full[:, y_indices, :, :]   # memmap slice, not copied yet
 
-        mae_c     = masked_mae_per_channel_np(preds_mean, Y_sel, masks_v[v])
-        rmse_c    = masked_rmse_per_channel_np(preds_mean, Y_sel, masks_v[v])
+        mae_c     = masked_mae_per_channel_np(preds_mean, Y_sel, mask_v)
+        rmse_c    = masked_rmse_per_channel_np(preds_mean, Y_sel, mask_v)
         log_mae_c = masked_log_mae_per_channel_np(
-            preds_mean, Y_sel, masks_v[v],
+            preds_mean, Y_sel, mask_v,
             y_indices=y_indices, pos_channels=pos_channels,
             signed_channels=signed_channels, eps_log=eps,
         )
-        mre_c = masked_relative_error_per_channel_np(preds_mean, Y_sel, masks_v[v])
+        mre_c = masked_relative_error_per_channel_np(preds_mean, Y_sel, mask_v)
+        del preds_mean, Y_sel, Y_full, mask_v
 
         print(f"  [{view_tag}] Physical MAE_avg  = {float(np.mean(mae_c)):.6g}")
         print(f"  [{view_tag}] Physical RMSE_avg = {float(np.mean(rmse_c)):.6g}")
